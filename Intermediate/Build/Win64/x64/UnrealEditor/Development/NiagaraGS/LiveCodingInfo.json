@@ -1,0 +1,23 @@
+{
+	"RemapUnityFiles": 
+	{
+		"Module.NiagaraGS.cpp.obj": [
+			"GaussianSplatAsset.gen.cpp.obj",
+			"GaussianSplatAssetFactory.gen.cpp.obj",
+			"GaussianSplatData.gen.cpp.obj",
+			"NiagaraGS.init.gen.cpp.obj",
+			"NiagaraGSBlueprintLibrary.gen.cpp.obj",
+			"NiagaraGSDataInterface.gen.cpp.obj",
+			"PerModuleInline.gen.cpp.obj",
+			"GaussianSplatAsset.cpp.obj",
+			"GaussianSplatAssetEditor.cpp.obj",
+			"GaussianSplatAssetFactory.cpp.obj",
+			"GaussianSplatAssetTypeActions.cpp.obj",
+			"NiagaraGSModule.cpp.obj",
+			"GaussianSplatPLYParser.cpp.obj",
+			"NiagaraGSBlueprintLibrary.cpp.obj",
+			"NiagaraGSDataInterface.cpp.obj",
+			"NiagaraGSDataInterfaceGPU.cpp.obj"
+		]
+	}
+}

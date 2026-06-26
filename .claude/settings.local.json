@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(NIAGARA=\"C:/Program Files/Epic Games/UE_5.6/Engine/Plugins/FX/Niagara/Source\" *)",
+      "Read(//c/Program Files/Epic Games/UE_5.6/Engine/Plugins/FX/Niagara/Source/**)",
+      "Bash(DI=\"C:/Program Files/Epic Games/UE_5.6/Engine/Plugins/FX/Niagara/Source/Niagara/Classes/NiagaraDataInterface.h\" *)",
+      "Bash(ENGINE=\"C:/Program Files/Epic Games/UE_5.6/Engine\" *)",
+      "Bash(perl -0pi -e 's/[ \\\\t]*VectorVM::FUserPtrHandler<FNiagaraGSPerInstanceData> InstData\\\\\\(Context\\\\\\);\\\\n//g' NiagaraGSDataInterface.cpp)"
+    ]
+  }
+}
