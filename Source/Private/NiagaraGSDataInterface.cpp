@@ -238,7 +238,11 @@ void UNiagaraGSDataInterface::PostInitProperties()
     }
     if (!HasAnyFlags(RF_ClassDefaultObject))
     {
-        Proxy = MakeUnique<FNDIGaussianSplatProxy>();
+        // Start the proxy at the current flush generation so it only responds to
+        // flushes issued AFTER it exists (never consumes a stale past flush).
+        TUniquePtr<FNDIGaussianSplatProxy> NewProxy = MakeUnique<FNDIGaussianSplatProxy>();
+        NewProxy->FlushedGeneration = GlobalFlushGeneration.Load();
+        Proxy = MoveTemp(NewProxy);
     }
 }
 
@@ -788,19 +792,36 @@ void UNiagaraGSDataInterface::SetShaderParameters(
     // This runs on the real rendering proxy, so everything here lands on exactly
     // the buffers the GPU draws from.
 
-    // 1) Consume a pending flush: release the splat VRAM once when the global
-    //    generation advances past the one this proxy last serviced.
+    if (!SplatProxy.bDiagLogged)
+    {
+        SplatProxy.bDiagLogged = true;
+        const TArray<FGaussianSplatData>* DiagSplats = GetSplatArray();
+        UE_LOG(LogTemp, Warning, TEXT("NiagaraGS: SetShaderParameters DIAG — bReady=%d bFlushed=%d gen=%llu/%llu SplatArray=%s count=%d SplatAsset=%s SourcePath='%s' DI=0x%p Proxy=0x%p"),
+            SplatProxy.bBuffersReady ? 1 : 0, SplatProxy.bManuallyFlushed ? 1 : 0,
+            (uint64)GetFlushGeneration(), (uint64)SplatProxy.FlushedGeneration,
+            DiagSplats ? TEXT("VALID") : TEXT("NULL"), DiagSplats ? DiagSplats->Num() : -1,
+            SplatAsset ? TEXT("set") : TEXT("null"), *SourceFilePath, this, &SplatProxy);
+    }
+
+    // 1) Consume a pending flush, but ONLY release buffers that actually exist.
+    //    Never mark a brand-new proxy "flushed" before it has uploaded — otherwise
+    //    a past flush (which bumped the global generation) would make every new GPU
+    //    proxy bind the fallback forever. This was the bug that left positions/
+    //    colour/SH empty on the GPU while the spawn/splat count still worked.
     const uint64 CurrentGen = GetFlushGeneration();
     if (CurrentGen > SplatProxy.FlushedGeneration)
     {
-        SplatProxy.ReleaseBuffers();
-        SplatProxy.bManuallyFlushed = true;
+        if (SplatProxy.bBuffersReady)
+        {
+            SplatProxy.ReleaseBuffers();
+            SplatProxy.bManuallyFlushed = true;
+        }
         SplatProxy.FlushedGeneration = CurrentGen;
     }
 
     // 2) Self-heal: upload the buffers once from the resolved CPU data (asset or
-    //    path-cached). This is what puts real data on the GPU and restores colour.
-    //    A manual flush is respected — we do not re-upload after it.
+    //    path-cached). This is what puts real data on the GPU. A *completed* manual
+    //    flush (bManuallyFlushed) is respected, so we don't re-upload after it.
     if (!SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed)
     {
         const TArray<FGaussianSplatData>* Splats = GetSplatArray();

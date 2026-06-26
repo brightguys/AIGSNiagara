@@ -67,6 +67,7 @@ struct FNDIGaussianSplatProxy : public FNiagaraDataInterfaceProxy
     bool   bBuffersReady    = false;
     bool   bManuallyFlushed = false;
     uint64 FlushedGeneration = 0;
+    bool   bDiagLogged       = false;   // one-shot diagnostic in SetShaderParameters
 
     // Shared zeroed fallback — bound when buffers aren't ready or were flushed,
     // so the shader never sees a null SRV.
