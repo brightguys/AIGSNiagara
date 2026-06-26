@@ -174,6 +174,11 @@ private:
     static FCriticalSection DiskCacheCS;
     static TMap<FString, TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>> DiskCache;
 
+    // Most recently resolved payload. The DI bound to the GPU compute script is
+    // often a different, UNCONFIGURED object (no asset, no path) than the one the
+    // user set up; it falls back to this so the GPU still gets real splat data.
+    static TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> GLastLoadedDiskData;
+
     // Global flush generation. A manual flush increments it; a proxy compares it to
     // the generation it last serviced and releases once when it advances.
     static TAtomic<uint64> GlobalFlushGeneration;
