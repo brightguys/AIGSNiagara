@@ -34,6 +34,7 @@ TAtomic<uint64> UNiagaraGSDataInterface::GlobalFlushGeneration(0);
 
 FCriticalSection UNiagaraGSDataInterface::DiskCacheCS;
 TMap<FString, TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>> UNiagaraGSDataInterface::DiskCache;
+TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> UNiagaraGSDataInterface::GLastLoadedDiskData;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Data-source resolution (imported asset OR raw .ply on disk)
@@ -75,6 +76,7 @@ void UNiagaraGSDataInterface::EnsureSplatDataLoaded()
         if (TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>* Found = DiskCache.Find(ResolvedPath))
         {
             ResolvedDiskData = *Found;
+            GLastLoadedDiskData = *Found;
             return;
         }
     }
@@ -95,6 +97,7 @@ void UNiagaraGSDataInterface::EnsureSplatDataLoaded()
         {
             FScopeLock Lock(&DiskCacheCS);
             DiskCache.Add(ResolvedPath, NewEntry);
+            GLastLoadedDiskData = NewEntry;
         }
         ResolvedDiskData = NewEntry;
 
@@ -135,6 +138,17 @@ const FGSDiskSplatData* UNiagaraGSDataInterface::ResolvedDiskPayload() const
         if (const TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>* Found = DiskCache.Find(ResolvedPath))
         {
             return Found->Get();
+        }
+    }
+
+    // Last resort: this DI is unconfigured (no asset, no path) — the GPU compute
+    // script's DI is typically such an object. Use the most recently loaded payload
+    // so the GPU still renders real data. (Single active splat file assumed.)
+    {
+        FScopeLock Lock(&DiskCacheCS);
+        if (GLastLoadedDiskData.IsValid())
+        {
+            return GLastLoadedDiskData.Get();
         }
     }
     return nullptr;
@@ -732,39 +746,19 @@ void UNiagaraGSDataInterface::GetSplatSHCoefficients(FVectorVMExternalFunctionCo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  FlushGPUBuffersVM
-//
-//  No per-instance data (PerInstanceDataSize()==0), so this raises a global flush
-//  generation; every live Gaussian Splat proxy releases its VRAM on its next render.
-//  Edge-latched so holding the bool high only triggers one flush.
+//  FlushGPUBuffersVM — manual flush DISABLED for now (kept registered so the
+//  scratchpad's FlushGPUBuffers node still binds). Consumes inputs, reports false.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void UNiagaraGSDataInterface::FlushGPUBuffersVM(FVectorVMExternalFunctionContext& Context)
 {
     FNDIInputParam<bool>  InFlush(Context);
     FNDIOutputParam<bool> OutSuccess(Context);
-
-    bool bShouldFlush = false;
     for (int32 i = 0; i < Context.GetNumInstances(); ++i)
     {
-        bShouldFlush |= InFlush.GetAndAdvance();
+        InFlush.GetAndAdvance();
+        OutSuccess.SetAndAdvance(false);
     }
-
-    if (bShouldFlush)
-    {
-        if (!bFlushLatch)
-        {
-            RequestGlobalFlush();   // rising edge only
-            bFlushLatch = true;
-        }
-    }
-    else
-    {
-        bFlushLatch = false;        // reset so the next true edge flushes again
-    }
-
-    for (int32 i = 0; i < Context.GetNumInstances(); ++i)
-        OutSuccess.SetAndAdvance(bShouldFlush);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -803,26 +797,10 @@ void UNiagaraGSDataInterface::SetShaderParameters(
             SplatAsset ? TEXT("set") : TEXT("null"), *SourceFilePath, this, &SplatProxy);
     }
 
-    // 1) Consume a pending flush, but ONLY release buffers that actually exist.
-    //    Never mark a brand-new proxy "flushed" before it has uploaded — otherwise
-    //    a past flush (which bumped the global generation) would make every new GPU
-    //    proxy bind the fallback forever. This was the bug that left positions/
-    //    colour/SH empty on the GPU while the spawn/splat count still worked.
-    const uint64 CurrentGen = GetFlushGeneration();
-    if (CurrentGen > SplatProxy.FlushedGeneration)
-    {
-        if (SplatProxy.bBuffersReady)
-        {
-            SplatProxy.ReleaseBuffers();
-            SplatProxy.bManuallyFlushed = true;
-        }
-        SplatProxy.FlushedGeneration = CurrentGen;
-    }
-
-    // 2) Self-heal: upload the buffers once from the resolved CPU data (asset or
-    //    path-cached). This is what puts real data on the GPU. A *completed* manual
-    //    flush (bManuallyFlushed) is respected, so we don't re-upload after it.
-    if (!SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed)
+    // Self-heal: upload the buffers once from the resolved CPU data (asset or
+    //    path-cached / last-loaded). This is what puts real data on the GPU.
+    //    (Manual flush is disabled for now.)
+    if (!SplatProxy.bBuffersReady)
     {
         const TArray<FGaussianSplatData>* Splats = GetSplatArray();
         if (Splats && Splats->Num() > 0)
