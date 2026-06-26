@@ -36,9 +36,15 @@ struct FGSDiskSplatData
  *
  *   • SetShaderParameters() runs on the real rendering proxy. It lazily uploads
  *     the buffers once (self-heal) from the resolved CPU data, then binds them.
+ *   • AutoFlushAfterRenders (per-system, recommended): the proxy releases its own
+ *     VRAM N renders after the upload — once the GPU spawn has copied the splats
+ *     into particle attributes. Because the proxy frees ITSELF, no global state and
+ *     no (unreliable) cross-proxy targeting is needed.
  *   • FlushGPUBuffers (scratchpad bool) or the Blueprint node bump a global flush
- *     generation; the proxy releases its buffers the next time it renders and
- *     binds the zeroed fallback so the shader never sees a null SRV.
+ *     generation; every proxy releases its buffers the next time it renders. This
+ *     is the coarse "free all" path.
+ *   • In every flushed state the zeroed fallback buffer is bound, so the shader
+ *     never sees a null SRV.
  *
  * DATA SOURCE
  * ─────────────────────────────────────────────────────────────────────────────
@@ -63,6 +69,19 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats",
         meta = (DisplayName = "Source File Path (.ply, no import)"))
     FString SourceFilePath;
+
+    // ── Auto-flush: release the splat VRAM once the GPU spawn has copied the data
+    //    into particle attributes. 0 = keep the buffers for the system's lifetime.
+    //    >0 = release this many renders after the upload. The proxy releases ITSELF
+    //    (it is the exact proxy the GPU reads from), so only this system is freed —
+    //    no global flush, no cross-system bleed, no unreliable proxy targeting.
+    //    Use 2 for a safe margin; the spawn dispatch has provably executed by then.
+    //    NOTE: only safe when the material/sim reads the COPIED particle attributes,
+    //    not the DI every frame. A system reset after auto-flush needs a fresh proxy
+    //    (level reload / recompile) to re-upload; the CPU data stays cached for that.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Memory",
+        meta = (ClampMin = "0", DisplayName = "Auto-Flush After Renders"))
+    int32 AutoFlushAfterRenders = 0;
 
     // ── UNiagaraDataInterface interface ───────────────────────────────────
 #if WITH_EDITORONLY_DATA
@@ -183,7 +202,7 @@ private:
     // the generation it last serviced and releases once when it advances.
     static TAtomic<uint64> GlobalFlushGeneration;
 
-    // Edge-latch for the scratchpad FlushGPUBuffers bool so holding it high only
-    // requests one flush (not one per frame). Transient, per-DI.
-    bool bFlushLatch = false;
+    // Rising-edge latch for the scratchpad/BP FlushGPUBuffers bool so holding it
+    // high requests a single (global) flush, not one per frame. Transient, per-DI.
+    bool bFlushEdgeLatch = false;
 };
