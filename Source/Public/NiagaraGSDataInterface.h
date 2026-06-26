@@ -67,6 +67,12 @@ public:
     // ── UNiagaraDataInterface interface ───────────────────────────────────
 #if WITH_EDITORONLY_DATA
     virtual void GetFunctionsInternal(TArray<FNiagaraFunctionSignature>& OutFunctions) const override;
+    // Bump the DI compile hash so Niagara regenerates scripts. CRITICAL: the
+    // hidden per-instance "user pointer" input the translator adds to CPU
+    // functions depends on PerInstanceDataSize(), which is NOT otherwise part of
+    // the hash — so without this, switching that value leaves stale bytecode that
+    // reads one register off (e.g. splat count landing in Emitter.ExecutionState).
+    virtual bool AppendCompileHash(FNiagaraCompileHashVisitor* InVisitor) const override;
 #endif
     virtual void GetVMExternalFunction(
         const FVMExternalFunctionBindingInfo& BindingInfo,
