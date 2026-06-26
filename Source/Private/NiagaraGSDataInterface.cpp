@@ -7,6 +7,7 @@
 #include "NiagaraCustomVersion.h"
 #include "NiagaraShaderParametersBuilder.h"
 #include "NiagaraSystemInstance.h"
+#include "NiagaraCompileHashVisitor.h"
 #include "VectorVM.h"
 #include "NiagaraGSDataInterfaceGPU.h"
 #include "GaussianSplatPLYParser.h"
@@ -446,6 +447,16 @@ void UNiagaraGSDataInterface::GetFunctionsInternal(TArray<FNiagaraFunctionSignat
             FNiagaraTypeDefinition::GetBoolDef(), TEXT("Success")));
         OutFunctions.Add(Sig);
     }
+}
+
+bool UNiagaraGSDataInterface::AppendCompileHash(FNiagaraCompileHashVisitor* InVisitor) const
+{
+    bool bSuccess = Super::AppendCompileHash(InVisitor);
+    // Bump this string whenever the DI's VM/HLSL function calling convention can
+    // change (e.g. PerInstanceDataSize switching, which adds/removes the hidden
+    // user-pointer input). It forces a clean recompile and avoids stale bytecode.
+    bSuccess &= InVisitor->UpdateString(TEXT("NiagaraGS_ABI"), TEXT("SingleBuffer_NoPerInstance_v1"));
+    return bSuccess;
 }
 #endif // WITH_EDITORONLY_DATA
 
