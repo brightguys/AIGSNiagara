@@ -190,6 +190,9 @@ bool UNiagaraGSDataInterface::CopyToInternal(UNiagaraDataInterface* Destination)
     UNiagaraGSDataInterface* Dest = CastChecked<UNiagaraGSDataInterface>(Destination);
     Dest->SplatAsset = SplatAsset;
     Dest->SourceFilePath = SourceFilePath;
+    // Carry the auto-flush threshold onto the duplicate Niagara binds to the compute
+    // script, so the proxy the GPU reads from sees the configured value.
+    Dest->AutoFlushAfterRenders = AutoFlushAfterRenders;
     // Hand the duplicate the already-parsed payload so Niagara's DI duplication
     // never triggers a re-parse of the file.
     Dest->ResolvedDiskData = ResolvedDiskData;
@@ -201,7 +204,8 @@ bool UNiagaraGSDataInterface::Equals(const UNiagaraDataInterface* Other) const
     if (!Super::Equals(Other)) return false;
     const UNiagaraGSDataInterface* OtherDI = CastChecked<const UNiagaraGSDataInterface>(Other);
     return OtherDI->SplatAsset == SplatAsset
-        && OtherDI->SourceFilePath == SourceFilePath;
+        && OtherDI->SourceFilePath == SourceFilePath
+        && OtherDI->AutoFlushAfterRenders == AutoFlushAfterRenders;
 }
 
 int32 UNiagaraGSDataInterface::GetSplatCount() const
@@ -746,19 +750,35 @@ void UNiagaraGSDataInterface::GetSplatSHCoefficients(FVectorVMExternalFunctionCo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  FlushGPUBuffersVM — manual flush DISABLED for now (kept registered so the
-//  scratchpad's FlushGPUBuffers node still binds). Consumes inputs, reports false.
+//  FlushGPUBuffersVM — scratchpad / module entry point (CPU stage only).
+//
+//  Rising-edge: holding the bool high requests ONE flush, not one per frame. This
+//  is a GLOBAL force-flush (every splat proxy releases on its next render) because
+//  the GPU reads from a duplicate DI proxy that cannot be targeted from here — for
+//  precise per-system control prefer the AutoFlushAfterRenders property instead.
+//
+//  Only fires on CPU emitters (GPU stages can't call CPU VM bindings). Call it from
+//  a System/Emitter UPDATE stage, never Spawn, so the spawn has already consumed the
+//  data before the buffers go away.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void UNiagaraGSDataInterface::FlushGPUBuffersVM(FVectorVMExternalFunctionContext& Context)
 {
     FNDIInputParam<bool>  InFlush(Context);
     FNDIOutputParam<bool> OutSuccess(Context);
+
+    bool bAnyHigh = false;
     for (int32 i = 0; i < Context.GetNumInstances(); ++i)
     {
-        InFlush.GetAndAdvance();
-        OutSuccess.SetAndAdvance(false);
+        bAnyHigh |= InFlush.GetAndAdvance();
+        OutSuccess.SetAndAdvance(true);
     }
+
+    if (bAnyHigh && !bFlushEdgeLatch)
+    {
+        RequestGlobalFlush();
+    }
+    bFlushEdgeLatch = bAnyHigh;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -786,6 +806,12 @@ void UNiagaraGSDataInterface::SetShaderParameters(
     // This runs on the real rendering proxy, so everything here lands on exactly
     // the buffers the GPU draws from.
 
+    // Mirror the game-thread config onto the proxy. This DI may be an unconfigured
+    // DUPLICATE of the one the user set up (Niagara binds the compute script's own
+    // copy), but DI duplication copies UPROPERTYs — see CopyToInternal — so the
+    // threshold travels with the object the GPU actually reads from.
+    SplatProxy.AutoFlushAfterRenders = AutoFlushAfterRenders;
+
     if (!SplatProxy.bDiagLogged)
     {
         SplatProxy.bDiagLogged = true;
@@ -797,19 +823,55 @@ void UNiagaraGSDataInterface::SetShaderParameters(
             SplatAsset ? TEXT("set") : TEXT("null"), *SourceFilePath, this, &SplatProxy);
     }
 
-    // Self-heal: upload the buffers once from the resolved CPU data (asset or
-    //    path-cached / last-loaded). This is what puts real data on the GPU.
-    //    (Manual flush is disabled for now.)
-    if (!SplatProxy.bBuffersReady)
+    // 1) Global force-flush (BP node / scratchpad bool). A flush bumps a global
+    //    generation; release ONCE when this proxy sees it advance, then latch so the
+    //    self-heal below does not immediately undo it. This is the coarse "free all"
+    //    path; AutoFlushAfterRenders is the precise per-system path.
+    const uint64 Gen = GetFlushGeneration();
+    if (Gen != SplatProxy.FlushedGeneration)
+    {
+        SplatProxy.FlushedGeneration = Gen;
+        if (SplatProxy.bBuffersReady)
+        {
+            SplatProxy.ReleaseBuffers();
+        }
+        SplatProxy.bManuallyFlushed = true;
+    }
+
+    // 2) Self-heal: upload the buffers once from the resolved CPU data (asset or
+    //    path-cached / last-loaded). This is what puts real data on the GPU, and it
+    //    runs BEFORE the spawn dispatch reads them. Skipped once intentionally
+    //    flushed so a flush is not undone on the very next bind.
+    bool bUploadedThisCall = false;
+    if (!SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed)
     {
         const TArray<FGaussianSplatData>* Splats = GetSplatArray();
         if (Splats && Splats->Num() > 0)
         {
             SplatProxy.UploadData(Splats->GetData(), Splats->Num(), GetResolvedSHDegree());
+            SplatProxy.RendersSinceReady = 0;
+            bUploadedThisCall = true;
         }
     }
 
-    // 3) Bind.
+    // 3) Auto self-flush. Once the buffers have been bound for AutoFlushAfterRenders
+    //    renders past the upload, the GPU spawn dispatch that reads them has provably
+    //    executed (particles persist), so the VRAM is dead weight — release it. The
+    //    upload frame itself is excluded so AutoFlushAfterRenders=1 still leaves one
+    //    full frame for the spawn. 0 = never; the proxy frees only itself.
+    if (SplatProxy.bBuffersReady && SplatProxy.AutoFlushAfterRenders > 0 && !bUploadedThisCall)
+    {
+        if (++SplatProxy.RendersSinceReady >= SplatProxy.AutoFlushAfterRenders)
+        {
+            SplatProxy.ReleaseBuffers();
+            SplatProxy.bManuallyFlushed = true;
+            UE_LOG(LogTemp, Log,
+                TEXT("NiagaraGS: Auto-flushed splat VRAM after %d renders (Proxy=0x%p)"),
+                SplatProxy.AutoFlushAfterRenders, &SplatProxy);
+        }
+    }
+
+    // 4) Bind.
     if (SplatProxy.bBuffersReady)
     {
         Params->SplatCount = SplatProxy.SplatCount;

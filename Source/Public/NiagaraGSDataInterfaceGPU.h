@@ -65,9 +65,18 @@ struct FNDIGaussianSplatProxy : public FNiagaraDataInterfaceProxy
     int32  SHDegree         = 0;
     int32  SplatCount       = 0;
     bool   bBuffersReady    = false;
+    // Set once the buffers have been intentionally released (auto-flush or a global
+    // force-flush). Blocks the self-heal upload from immediately re-uploading; only
+    // a fresh proxy (level reload / recompile) re-uploads after this latches.
     bool   bManuallyFlushed = false;
     uint64 FlushedGeneration = 0;
     bool   bDiagLogged       = false;   // one-shot diagnostic in SetShaderParameters
+
+    // Auto-flush bookkeeping (render thread). RendersSinceReady counts SetShader
+    // parameter binds since the last upload; when it reaches AutoFlushAfterRenders
+    // (>0) the proxy releases its own VRAM. Mirrored from the DI UPROPERTY each bind.
+    int32  RendersSinceReady     = 0;
+    int32  AutoFlushAfterRenders = 0;
 
     // Shared zeroed fallback — bound when buffers aren't ready or were flushed,
     // so the shader never sees a null SRV.
