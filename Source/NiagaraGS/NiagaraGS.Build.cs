@@ -30,19 +30,9 @@ public class NiagaraGS : ModuleRules
             "NiagaraShader",
         });
 
-        // Editor-only modules — stripped from packaged builds
-        if (Target.bBuildEditor)
-        {
-            PrivateDependencyModuleNames.AddRange(new string[]
-            {
-                "UnrealEd",               // UFactory base class, import framework
-                "AssetTools",             // IAssetTypeActions, asset category registration
-                "ContentBrowser",         // Content Browser integration
-                "Slate",                  // Layout and UI
-                "SlateCore",              // Core widget and style types
-                "WorkspaceMenuStructure", // Tab category structures
-            });
-        }
+        // Editor-only code (import factory, asset type actions, asset editor)
+        // lives in the separate NiagaraGSEditor module, so this runtime module
+        // has no editor framework dependencies and compiles for packaged builds.
 
         // The module's own Private folder is already on the include path, so no
         // extra PrivateIncludePaths entry is needed here.

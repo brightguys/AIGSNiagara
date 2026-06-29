@@ -13,41 +13,75 @@ coefficients). Because the splats become Niagara particles, they can be animated
 with the full Niagara toolset.
 
 This repo is **only the plugin** — there is no `.uproject` here. It is meant to
-be dropped into a host UE project's `Plugins/` folder (or the engine's). The
-module loads at `PostEngineInit` and its name is `NiagaraGS`.
+be dropped into a host UE project's `Plugins/` folder (or the engine's). It ships
+**two modules**, both loading at `PostEngineInit`: `NiagaraGS` (Runtime — all
+runtime/render code, no editor deps) and `NiagaraGSEditor` (Editor — `.ply`
+import factory, Content Browser integration, asset editor).
 
 ## Build & environment
 
 - **No CI, no test suite, no build scripts in this repo.** Building happens
   inside a host UE 5.6 project — there is nothing to `make`/`npm`/`cmake` here.
-  Do not invent build/test commands.
-- The module is compiled by Unreal Build Tool from `Source/NiagaraGS.Build.cs`.
+  Do not invent build/test commands. (To produce a redistributable precompiled
+  build, see **Packaging a precompiled plugin** below.)
+- The modules are compiled by Unreal Build Tool from
+  `Source/NiagaraGS/NiagaraGS.Build.cs` and
+  `Source/NiagaraGSEditor/NiagaraGSEditor.Build.cs`.
 - `Intermediate/` and `Binaries/` are git-ignored; never commit them.
-- Editor-only dependencies (`UnrealEd`, `AssetTools`, `Slate`, etc.) are added
-  only when `Target.bBuildEditor` is true — keep editor code behind
-  `#if WITH_EDITOR` / `#if WITH_EDITORONLY_DATA` so packaged (non-editor) builds
-  still compile.
+- **Editor-only code lives in the `NiagaraGSEditor` module, not behind
+  `#if WITH_EDITOR` in the runtime module.** The editor frameworks (`UnrealEd`,
+  `AssetTools`, `Slate`, etc.) are normal dependencies of `NiagaraGSEditor` (an
+  `Editor`-type module that is only ever built for editor targets). Runtime
+  UObjects that merely *need* editor-only **members/methods** (e.g.
+  `UGaussianSplatAsset::ReimportFromSource`) still guard those with
+  `#if WITH_EDITOR` and stay in the runtime module — that is fine. What does
+  **not** work is an editor-only **`UCLASS`** (e.g. a `UFactory` subclass) in the
+  runtime module: UnrealHeaderTool reflects the `UCLASS` even when the whole
+  thing is wrapped in `#if WITH_EDITOR`, so packaged (`UnrealGame`) builds fail
+  with "Unable to find parent class type". Put such classes in `NiagaraGSEditor`.
 - The local `.claude/settings.local.json` allowlists reading the engine's
   bundled Niagara source (`UE_5.6/Engine/Plugins/FX/Niagara/Source/**`). That
   engine source is the reference for NDI/Niagara APIs when signatures are unclear.
 
 ## Source layout
 
-All code lives under `Source/`, split into UE's standard `Public/` (headers) and
-`Private/` (implementation), plus `Shaders/`.
+Each module gets its own folder under `Source/`, in UE's canonical layout —
+`Source/<Module>/<Module>.Build.cs` plus the module's `Public/` (headers) and
+`Private/` (implementation). Do **not** put a module's `.Build.cs` directly in
+`Source/`: with one module's source rooted at `Source/`, UBT treats a sibling
+module's subfolder as part of it and never registers the second module
+("Could not find definition for module …").
+
+```
+Source/
+  NiagaraGS/            (Runtime module)
+    NiagaraGS.Build.cs
+    Public/  Private/  Shaders/
+  NiagaraGSEditor/      (Editor module)
+    NiagaraGSEditor.Build.cs
+    Public/  Private/
+```
+
+**`NiagaraGS` (Runtime)** — no editor framework dependencies:
 
 | Area | Files | Role |
 |------|-------|------|
-| **Module** | `NiagaraGSModule.{h,cpp}` | `IModuleInterface`; registers asset type actions (editor) and the shader dir. |
+| **Module** | `NiagaraGSModule.{h,cpp}` | `IModuleInterface`; registers the shader dir. |
 | **Splat data model** | `GaussianSplatData.h` | `FGaussianSplatData` USTRUCT (one splat) + GPU packing constants. |
 | **PLY parsing** | `GaussianSplatPLYParser.{h,cpp}` | Stateless `.ply` → `TArray<FGaussianSplatData>` parser (ASCII + binary LE), SH-degree detection, coordinate conversion. |
-| **Imported asset** | `GaussianSplatAsset.{h,cpp}` | `UGaussianSplatAsset` UObject holding parsed splats; reimport support. |
-| **Editor import** | `GaussianSplatAssetFactory.{h,cpp}` | `UFactory` that runs when a `.ply` is dropped into the Content Browser. |
-| **Editor integration** | `GaussianSplatAssetTypeActions.{h,cpp}`, `GaussianSplatAssetEditor.{h,cpp}` | Content Browser type registration + a minimal summary asset editor (avoids rendering 100k+ structs). |
+| **Imported asset** | `GaussianSplatAsset.{h,cpp}` | `UGaussianSplatAsset` UObject holding parsed splats; reimport support (`#if WITH_EDITOR` members). |
 | **Niagara DI (game thread)** | `NiagaraGSDataInterface.{h,cpp}` | The custom `UNiagaraDataInterface`. CPU VM bindings, dynamic GPU HLSL generation, data-source resolution, flush logic. |
 | **Niagara DI (render thread)** | `NiagaraGSDataInterfaceGPU.{h,cpp}` | `FNDIGaussianSplatProxy`: owns the GPU buffers/SRVs, upload + release. Shader parameter struct. |
 | **Blueprint API** | `NiagaraGSBlueprintLibrary.{h,cpp}` | `FlushGaussianSplatBuffers` BP node to free VRAM on demand. |
 | **Shader** | `Shaders/NiagaraGSDataInterface.ush` | **Deprecated/empty** — see note below. |
+
+**`NiagaraGSEditor` (Editor)** — depends on `NiagaraGS` + the editor frameworks:
+
+| Area | Files | Role |
+|------|-------|------|
+| **Editor module** | `NiagaraGSEditorModule.{h,cpp}` | `IModuleInterface`; registers/unregisters the asset type actions. |
+| **Editor import** | `GaussianSplatAssetFactory.{h,cpp}` | `UFactory` that runs when a `.ply` is dropped into the Content Browser. (Auto-discovered via its CDO — no manual registration.) |
+| **Editor integration** | `GaussianSplatAssetTypeActions.{h,cpp}`, `GaussianSplatAssetEditor.{h,cpp}` | Content Browser type registration + a minimal summary asset editor (avoids rendering 100k+ structs). |
 
 ## Architecture & critical conventions
 
@@ -123,6 +157,29 @@ The GPU buffer pads **every** splat to the padded count regardless of actual SH
 degree so the material indexes without per-splat branching. If you change
 packing here, change the consuming material custom node too.
 
+## Packaging a precompiled plugin
+
+To produce a redistributable, drop-in build (precompiled `Binaries/` so testers
+just unzip into `Project/Plugins/` with no compile step), run the engine's
+`BuildPlugin` automation tool. From any shell on Windows:
+
+```powershell
+& "C:\Program Files\Epic Games\UE_5.6\Engine\Build\BatchFiles\RunUAT.bat" BuildPlugin `
+    -Plugin="C:\Users\deety\Documents\Unreal Projects\GSPlugin\Plugins\NiagaraGS\NiagaraGS.uplugin" `
+    -Package="C:\Users\deety\Documents\Unreal Projects\GSPlugin\Packaged\NiagaraGS" `
+    -TargetPlatforms=Win64 -Rocket
+```
+
+- `-Rocket` builds against the installed (Launcher) engine so the binaries load
+  for testers on the same UE 5.6 Launcher build.
+- It builds **both** the editor and the packaged-game (`UnrealGame`) targets, so
+  it's also the quickest way to catch the editor-vs-runtime module mistakes
+  described above.
+- The output folder is fully self-contained. For distribution you can delete
+  `Intermediate/` and the `Binaries/**/*.pdb` symbols (regenerable / not needed),
+  then zip the `NiagaraGS` folder. `BuildPlugin` stamps `"Installed": true` in the
+  output `.uplugin` so the editor loads the binaries without rebuilding.
+
 ## Working in this codebase
 
 - **Match the surrounding style.** Existing code uses UE conventions: `F`/`U`
@@ -132,7 +189,9 @@ packing here, change the consuming material custom node too.
 - **Threading matters.** Be explicit about game vs render thread. Anything
   touching RHI/SRV/`FBufferRHIRef` belongs on the render thread or must be
   enqueued there.
-- **Keep editor-only code guarded** so packaged builds compile.
+- **Keep editor-only code in the `NiagaraGSEditor` module** (not in the runtime
+  module) so packaged builds compile — see Build & environment above for the
+  `UCLASS`-vs-`#if WITH_EDITOR` rule.
 - When unsure about a Niagara/NDI API, consult the engine's Niagara source
   (allowlisted at `UE_5.6/.../Niagara/Source/`) rather than guessing.
 
