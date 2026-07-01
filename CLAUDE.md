@@ -155,6 +155,21 @@ stalls and stale bytecode). Respect them.
   `ReloadFromDisk` only swaps CPU/GPU data; it does not reset the Niagara system,
   so the GPU spawn burst count (set once by the emitter) won't itself change —
   react to `OnReloadComplete` and call `ResetSystem()` on the owning component.
+- **The `UCLASS` needs `BlueprintType`, or none of this is reachable from
+  Blueprint.** Blueprint's "Cast To" node requires the target class to declare
+  `BlueprintType`; without it there is no way to cast a generic
+  `UNiagaraDataInterface*` down to this subclass, so `ReloadFromDisk`,
+  `OnReloadComplete`, or any future `BlueprintCallable` added here are
+  unreachable from a BP graph (confirmed by regression — this is why
+  `FlushGaussianSplatBuffers` originally had to be a static
+  `UNiagaraGSBlueprintLibrary` function taking a `UNiagaraComponent*` instead of
+  a method called directly on the DI). The built-in
+  `UNiagaraDataInterfaceRenderTarget2D` proves a concrete DI subclass can safely
+  be `BlueprintType` despite the abstract `UNiagaraDataInterface` base not being
+  one. To get the object in Blueprint: `UNiagaraComponent::GetDataInterface(Name)`
+  (deprecated since 4.27, still functional in 5.6, and there is no non-deprecated
+  `BlueprintCallable` generic replacement in `UNiagaraFunctionLibrary` — its
+  equivalents are C++-only templates) → Cast to the DI's Blueprint type.
 - **RHI release is marshalled to the render thread.** GC may run the proxy
   destructor on the game thread, so RHI releases go through
   `ENQUEUE_RENDER_COMMAND`. Keep this pattern for any new GPU resource.

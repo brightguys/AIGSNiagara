@@ -55,7 +55,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
  *                      once and cached process-wide (keyed by absolute path).
  * ─────────────────────────────────────────────────────────────────────────────
  */
-UCLASS(EditInlineNew, Category = "Gaussian Splats",
+UCLASS(EditInlineNew, BlueprintType, Category = "Gaussian Splats",
     meta = (DisplayName = "Gaussian Splat Data Interface"))
     class NIAGARAGS_API UNiagaraGSDataInterface : public UNiagaraDataInterface
 {
