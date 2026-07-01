@@ -75,7 +75,7 @@ Source/
 | **PLY parsing** | `GaussianSplatPLYParser.{h,cpp}` | Stateless `.ply` → `TArray<FGaussianSplatData>` parser (ASCII + binary LE), SH-degree detection, coordinate conversion. |
 | **Niagara DI (game thread)** | `NiagaraGSDataInterface.{h,cpp}` | The custom `UNiagaraDataInterface`. CPU VM bindings, dynamic GPU HLSL generation, data-source resolution, flush logic, async hot reload (`ReloadFromDisk`). |
 | **Niagara DI (render thread)** | `NiagaraGSDataInterfaceGPU.{h,cpp}` | `FNDIGaussianSplatProxy`: owns the GPU buffers/SRVs, upload + release. Shader parameter struct. |
-| **Blueprint API** | `NiagaraGSBlueprintLibrary.{h,cpp}` | `FlushGaussianSplatBuffers` BP node to free VRAM on demand. |
+| **Blueprint API** | `NiagaraGSBlueprintLibrary.{h,cpp}` | `FlushGaussianSplatBuffers` BP node to free VRAM on demand; `ReactivateGaussianSplatSystem` to make a completed `ReloadFromDisk()` visible (see DI rules below — plain `ResetSystem()` is not enough). |
 | **Shader** | `Shaders/NiagaraGSDataInterface.ush` | **Deprecated/empty** — see note below. |
 
 ## Architecture & critical conventions
@@ -169,14 +169,24 @@ stalls and stale bytecode). Respect them.
   `ReloadFromDisk` only swaps CPU/GPU data; it does not reset the Niagara system,
   so the GPU spawn burst count (set once by the emitter) won't itself change —
   react to `OnReloadComplete` and call `ResetSystem()` on the owning component.
-  Do NOT reach for `ReinitializeSystem()` here even though the engine's own
-  Details-panel "Reset" button effectively does that (`Activate(true)` +
-  `ReregisterComponent()`, confirmed in `NiagaraComponentDetails.cpp`) — that
-  fully destroys and recreates the system instance (a real hitch, defeating the
-  point of hot-swapping) and was only "necessary" before this fix because it
-  incidentally forced a fresh, non-stale GPU-bound duplicate. Plain `ResetSystem()`
-  is sufficient now that the generation-mismatch branch reads
-  `GLastLoadedDiskData` directly.
+- **Making the new data visible needs `Activate(true)` AND `ReregisterComponent()`
+  — `ResetSystem()` alone is NOT enough, confirmed by regression.** After the
+  `GLastLoadedDiskData` fix above, the GPU buffer demonstrably gets the new splats
+  (`UE_LOG` "Uploaded N splats" fires with the correct new count right after
+  `ReloadFromDisk`, before touching any reset) — but calling `ResetSystem()`
+  (`Activate(true)` alone) from Blueprint still visually kept showing the old
+  splats. Only the Niagara Component's Details-panel "Reset" button worked, and
+  its handler (`FNiagaraComponentDetails::OnResetSelectedSystem` in
+  `NiagaraComponentDetails.cpp`) does `Activate(true)` **then**
+  `ReregisterComponent()` — the extra step actually responsible for making
+  particles respawn against the new buffer (particles copy their attributes from
+  the DI buffer once, at spawn time — see `AutoFlushAfterRenders` above — so nothing
+  new appears until something forces an actual respawn). `ReregisterComponent()`
+  is not `BlueprintCallable` in the engine, so
+  `UNiagaraGSBlueprintLibrary::ReactivateGaussianSplatSystem(Component)` wraps
+  both calls for Blueprint. Do not "simplify" this back down to just
+  `ResetSystem()`/`Activate(true)` without re-confirming in a live GPU-emitter
+  test — the `ReregisterComponent()` call is load-bearing.
 - **The `UCLASS` needs `BlueprintType`, or none of this is reachable from
   Blueprint.** Blueprint's "Cast To" node requires the target class to declare
   `BlueprintType`; without it there is no way to cast a generic

@@ -34,4 +34,22 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Gaussian Splats",
               meta = (DisplayName = "Flush Gaussian Splat GPU Buffers"))
     static bool FlushGaussianSplatBuffers(UNiagaraComponent* Component);
+
+    /**
+     * Fully reactivates the component so a completed ReloadFromDisk() shows up
+     * visually. Plain "Reset System" (Activate(true) alone) resets simulation
+     * state but does not reliably force the GPU particles to actually respawn
+     * against new buffer contents — particles copy their attributes from the DI
+     * buffer once, at spawn time, and don't resample it every frame. The editor's
+     * Niagara Component Details panel "Reset" button additionally calls
+     * ReregisterComponent(), which is what actually makes it work — but
+     * ReregisterComponent() itself is not BlueprintCallable in the engine, hence
+     * this wrapper (confirmed against NiagaraComponentDetails.cpp's button
+     * handler, which does exactly Activate(true) + ReregisterComponent()).
+     *
+     * @return true if the component was valid and reactivated.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Gaussian Splats",
+              meta = (DisplayName = "Reactivate Gaussian Splat System"))
+    static bool ReactivateGaussianSplatSystem(UNiagaraComponent* Component);
 };

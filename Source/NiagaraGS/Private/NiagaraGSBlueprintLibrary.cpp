@@ -24,3 +24,20 @@ bool UNiagaraGSBlueprintLibrary::FlushGaussianSplatBuffers(UNiagaraComponent* Co
     const FNiagaraSystemInstanceID InstanceID = Controller->GetSystemInstanceID();
     return UNiagaraGSDataInterface::FlushBuffersForSystemInstance(InstanceID);
 }
+
+bool UNiagaraGSBlueprintLibrary::ReactivateGaussianSplatSystem(UNiagaraComponent* Component)
+{
+    if (!Component)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("NiagaraGS: ReactivateGaussianSplatSystem — null component"));
+        return false;
+    }
+
+    // Mirrors NiagaraComponentDetails.cpp's "Reset" button handler exactly.
+    // Activate(true) alone (what ResetSystem() does) is not sufficient — see the
+    // header comment for why.
+    Component->Activate(true);
+    Component->ReregisterComponent();
+    return true;
+}
