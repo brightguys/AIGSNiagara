@@ -144,14 +144,31 @@ stalls and stale bytecode). Respect them.
   completion, game thread) bumps `GDataGeneration` — a global `TAtomic<uint64>`,
   not a per-instance counter — because the GPU-bound object `SetShaderParameters`
   runs on may not be the instance `ReloadFromDisk()` was called on (see the
-  GLastLoadedDiskData bullet above). `SetShaderParameters` re-uploads once when it
-  sees the generation advance past the proxy's own `UploadedDataGeneration`, even
-  if buffers are already ready. Trade-off: reloading any one system also makes
-  every other unrelated system's proxy redundantly re-upload its own unchanged
-  data once — accepted for the same "single active splat file assumed" reason as
-  the fallback above. `ReloadRequestCounter`, by contrast, IS per-instance (plain
-  `uint64`, game-thread-only) — it only discards a stale out-of-order completion
-  on the same object, so it doesn't need to be global.
+  GLastLoadedDiskData bullet above). Trade-off: reloading any one system also
+  makes every other unrelated system's proxy redundantly re-upload its own
+  unchanged data once — accepted for the same "single active splat file assumed"
+  reason as the fallback above. `ReloadRequestCounter`, by contrast, IS
+  per-instance (plain `uint64`, game-thread-only) — it only discards a stale
+  out-of-order completion on the same object, so it doesn't need to be global.
+- **The data-generation re-upload check is deliberately NOT gated on
+  `bBuffersReady`/`bManuallyFlushed` — a newer reload must override a flush, or
+  flush-then-reload deadlocks permanently.** Confirmed by regression: flush
+  (`bBuffersReady=false`, `bManuallyFlushed=true`) then `ReloadFromDisk()` a new
+  file → every particle collapsed onto the single-element zeroed fallback buffer
+  forever (massive overdraw, all particles at one position), and even a full
+  Details-panel Reset didn't recover it. Why: the flush latch (`bManuallyFlushed`)
+  is only ever cleared by a *successful* `UploadData()` call, but the hot-reload
+  branch used to require `bBuffersReady==true` to even check the generation, and
+  self-heal (below) requires `bManuallyFlushed==false` to run — after a flush,
+  neither can ever fire again, so nothing can ever call `UploadData()` to clear
+  the latch. (The Details-panel Reset didn't help either because
+  `ReregisterComponent()` recreates the Niagara Component's *scene* render proxy,
+  not this DI's own `FNDIGaussianSplatProxy` — that one is owned by the DI UObject
+  itself, created once in `PostInitProperties`, so the same stuck flags survive a
+  reregister.) Fix: the generation-mismatch check now only compares
+  `GetDataGeneration()` against the proxy's own `UploadedDataGeneration` — no
+  other precondition — since a genuinely newer reload is a strictly more specific
+  "show THIS data now" signal than a preceding flush's "stay quiet".
   **On a generation-mismatch re-upload, read `GLastLoadedDiskData` directly —
   never `GetSplatArray()`/`this`.** Confirmed by regression: after one successful
   load, the GPU-bound duplicate already has a non-empty (but stale)
