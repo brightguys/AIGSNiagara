@@ -4,7 +4,6 @@
 #include "NiagaraDataInterface.h"
 #include "NiagaraCommon.h"
 #include "GaussianSplatData.h"
-#include "GaussianSplatAsset.h"
 #include "NiagaraGSDataInterfaceGPU.h"
 #include "NiagaraDataInterfaceRW.h"
 #include "NiagaraShaderParametersBuilder.h"
@@ -48,10 +47,8 @@ struct FGSDiskSplatData
  *
  * DATA SOURCE
  * ─────────────────────────────────────────────────────────────────────────────
- *   • SplatAsset      — an imported UGaussianSplatAsset (.ply dragged into UE), or
- *   • SourceFilePath  — a raw .ply path read straight off disk, no import. Parsed
- *                       once and cached process-wide.
- * SplatAsset takes priority when both are set.
+ *   • SourceFilePath — a raw .ply path read straight off disk, no import. Parsed
+ *                      once and cached process-wide (keyed by absolute path).
  * ─────────────────────────────────────────────────────────────────────────────
  */
 UCLASS(EditInlineNew, Category = "Gaussian Splats",
@@ -61,13 +58,9 @@ UCLASS(EditInlineNew, Category = "Gaussian Splats",
     GENERATED_BODY()
 
 public:
-    // ── Data source: imported asset ───────────────────────────────────────
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats")
-    TObjectPtr<UGaussianSplatAsset> SplatAsset;
-
-    // ── Data source: raw .ply path on disk (used only when SplatAsset is null) ─
+    // ── Data source: raw .ply path on disk ────────────────────────────────
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats",
-        meta = (DisplayName = "Source File Path (.ply, no import)"))
+        meta = (DisplayName = "Source File Path (.ply)"))
     FString SourceFilePath;
 
     // ── Auto-flush: release the splat VRAM once the GPU spawn has copied the data
@@ -175,27 +168,33 @@ private:
     static const FName Name_GetSplatSHCoefficients;
     static const FName Name_FlushGPUBuffers;
 
-    // ── Resolved CPU splat data (asset OR disk-loaded cache) ──────────────
+    // ── Resolved CPU splat data (disk-loaded, process-wide cache) ─────────
     // Parses SourceFilePath once (or hits the process-wide cache). Game thread.
     void EnsureSplatDataLoaded();
 
     const TArray<FGaussianSplatData>* GetSplatArray() const;
     int32 GetResolvedSHDegree() const;
 
-    // This DI's handle into the shared disk cache (null when using SplatAsset).
+    // This DI's own resolved handle into the shared disk cache.
     TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> ResolvedDiskData;
 
     // Resolves the disk payload: this DI's handle if set, else the process-wide
-    // cache looked up by SourceFilePath. Works on any thread once parsed.
+    // cache looked up by SourceFilePath, else GLastLoadedDiskData. Works on any
+    // thread once parsed.
     const FGSDiskSplatData* ResolvedDiskPayload() const;
 
     // Process-wide parse-once cache, keyed by absolute file path.
     static FCriticalSection DiskCacheCS;
     static TMap<FString, TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>> DiskCache;
 
-    // Most recently resolved payload. The DI bound to the GPU compute script is
-    // often a different, UNCONFIGURED object (no asset, no path) than the one the
-    // user set up; it falls back to this so the GPU still gets real splat data.
+    // Last-resort fallback for a DI instance with an EMPTY SourceFilePath — this
+    // happens because Niagara's GPU-compute-script binding for this DI can be a
+    // duplicate captured at system-instance init time, before the user parameter
+    // override's SourceFilePath was set; that duplicate never gets refreshed, so
+    // without this it self-heals to zero splats forever. Scoped as tightly as we
+    // can without live per-instance correlation: cleared by RequestGlobalFlush(),
+    // so deleting/reconfiguring the source and hitting Flush drops the ghost data.
+    // ("Single active splat file" assumption — see class comment.)
     static TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> GLastLoadedDiskData;
 
     // Global flush generation. A manual flush increments it; a proxy compares it to

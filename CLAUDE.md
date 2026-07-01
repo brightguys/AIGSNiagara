@@ -5,18 +5,22 @@ Guidance for AI assistants working in this repository.
 ## What this is
 
 **NiagaraGS** is an Unreal Engine 5 (UE 5.6) plugin that renders **animatable
-Gaussian Splats** through Niagara GPU simulation. It imports `.ply` Gaussian
-Splat files, exposes the splat data to Niagara particles via a custom
-**Niagara Data Interface (NDI)**, and lets the GPU simulation spawn one particle
-per splat (position, scale, orientation, color/opacity, and spherical-harmonic
-coefficients). Because the splats become Niagara particles, they can be animated
-with the full Niagara toolset.
+Gaussian Splats** through Niagara GPU simulation. It reads `.ply` Gaussian Splat
+files straight off disk, exposes the splat data to Niagara particles via a
+custom **Niagara Data Interface (NDI)**, and lets the GPU simulation spawn one
+particle per splat (position, scale, orientation, color/opacity, and
+spherical-harmonic coefficients). Because the splats become Niagara particles,
+they can be animated with the full Niagara toolset.
 
 This repo is **only the plugin** — there is no `.uproject` here. It is meant to
 be dropped into a host UE project's `Plugins/` folder (or the engine's). It ships
-**two modules**, both loading at `PostEngineInit`: `NiagaraGS` (Runtime — all
-runtime/render code, no editor deps) and `NiagaraGSEditor` (Editor — `.ply`
-import factory, Content Browser integration, asset editor).
+**one module**, `NiagaraGS` (Runtime — all code, no editor deps), loading at
+`PostEngineInit`. There is currently no `.ply` import pipeline or Content
+Browser integration — the DI reads a raw on-disk path (`SourceFilePath`)
+directly; there is no imported-`UAsset` data source. If editor-only tooling is
+added in the future (an import factory, an asset editor, etc.), put it in a
+new, separate `Editor`-type module rather than in `NiagaraGS` — see the
+`UCLASS`-vs-`#if WITH_EDITOR` rule below for why.
 
 ## Build & environment
 
@@ -24,42 +28,42 @@ import factory, Content Browser integration, asset editor).
   inside a host UE 5.6 project — there is nothing to `make`/`npm`/`cmake` here.
   Do not invent build/test commands. (To produce a redistributable precompiled
   build, see **Packaging a precompiled plugin** below.)
-- The modules are compiled by Unreal Build Tool from
-  `Source/NiagaraGS/NiagaraGS.Build.cs` and
-  `Source/NiagaraGSEditor/NiagaraGSEditor.Build.cs`.
+- The module is compiled by Unreal Build Tool from
+  `Source/NiagaraGS/NiagaraGS.Build.cs`.
 - `Intermediate/` and `Binaries/` are git-ignored; never commit them.
-- **Editor-only code lives in the `NiagaraGSEditor` module, not behind
-  `#if WITH_EDITOR` in the runtime module.** The editor frameworks (`UnrealEd`,
-  `AssetTools`, `Slate`, etc.) are normal dependencies of `NiagaraGSEditor` (an
-  `Editor`-type module that is only ever built for editor targets). Runtime
-  UObjects that merely *need* editor-only **members/methods** (e.g.
-  `UGaussianSplatAsset::ReimportFromSource`) still guard those with
-  `#if WITH_EDITOR` and stay in the runtime module — that is fine. What does
-  **not** work is an editor-only **`UCLASS`** (e.g. a `UFactory` subclass) in the
-  runtime module: UnrealHeaderTool reflects the `UCLASS` even when the whole
-  thing is wrapped in `#if WITH_EDITOR`, so packaged (`UnrealGame`) builds fail
-  with "Unable to find parent class type". Put such classes in `NiagaraGSEditor`.
+- **Editor-only `UCLASS`es must live in a separate `Editor`-type module, not
+  behind `#if WITH_EDITOR` in the runtime module.** Runtime UObjects that merely
+  *need* editor-only **members/methods** can still guard those with
+  `#if WITH_EDITOR` and stay in the runtime module — that is fine (e.g.
+  `UNiagaraGSDataInterface::PostEditChangeProperty`). What does **not** work is
+  an editor-only **`UCLASS`** (e.g. a `UFactory` subclass) in the runtime
+  module: UnrealHeaderTool reflects the `UCLASS` even when the whole thing is
+  wrapped in `#if WITH_EDITOR`, so packaged (`UnrealGame`) builds fail with
+  "Unable to find parent class type". This plugin used to ship a second
+  `NiagaraGSEditor` module for exactly this reason (a `.ply` import factory +
+  Content Browser integration); that pipeline was removed (disk-path-only now),
+  so there is currently only one module — but if editor-only `UCLASS` tooling
+  is added again, recreate a dedicated Editor module for it.
 - The local `.claude/settings.local.json` allowlists reading the engine's
   bundled Niagara source (`UE_5.6/Engine/Plugins/FX/Niagara/Source/**`). That
   engine source is the reference for NDI/Niagara APIs when signatures are unclear.
 
 ## Source layout
 
-Each module gets its own folder under `Source/`, in UE's canonical layout —
+The module's source lives under `Source/NiagaraGS/`, in UE's canonical layout —
 `Source/<Module>/<Module>.Build.cs` plus the module's `Public/` (headers) and
-`Private/` (implementation). Do **not** put a module's `.Build.cs` directly in
-`Source/`: with one module's source rooted at `Source/`, UBT treats a sibling
-module's subfolder as part of it and never registers the second module
-("Could not find definition for module …").
+`Private/` (implementation). If a second module is ever added (e.g. an editor
+module), give it its own sibling folder under `Source/` with its own
+`.Build.cs`; do **not** put a module's `.Build.cs` directly in `Source/` itself
+— with one module's source rooted at `Source/`, UBT treats a sibling module's
+subfolder as part of it and never registers the second module ("Could not find
+definition for module …").
 
 ```
 Source/
   NiagaraGS/            (Runtime module)
     NiagaraGS.Build.cs
     Public/  Private/  Shaders/
-  NiagaraGSEditor/      (Editor module)
-    NiagaraGSEditor.Build.cs
-    Public/  Private/
 ```
 
 **`NiagaraGS` (Runtime)** — no editor framework dependencies:
@@ -69,19 +73,10 @@ Source/
 | **Module** | `NiagaraGSModule.{h,cpp}` | `IModuleInterface`; registers the shader dir. |
 | **Splat data model** | `GaussianSplatData.h` | `FGaussianSplatData` USTRUCT (one splat) + GPU packing constants. |
 | **PLY parsing** | `GaussianSplatPLYParser.{h,cpp}` | Stateless `.ply` → `TArray<FGaussianSplatData>` parser (ASCII + binary LE), SH-degree detection, coordinate conversion. |
-| **Imported asset** | `GaussianSplatAsset.{h,cpp}` | `UGaussianSplatAsset` UObject holding parsed splats; reimport support (`#if WITH_EDITOR` members). |
 | **Niagara DI (game thread)** | `NiagaraGSDataInterface.{h,cpp}` | The custom `UNiagaraDataInterface`. CPU VM bindings, dynamic GPU HLSL generation, data-source resolution, flush logic. |
 | **Niagara DI (render thread)** | `NiagaraGSDataInterfaceGPU.{h,cpp}` | `FNDIGaussianSplatProxy`: owns the GPU buffers/SRVs, upload + release. Shader parameter struct. |
 | **Blueprint API** | `NiagaraGSBlueprintLibrary.{h,cpp}` | `FlushGaussianSplatBuffers` BP node to free VRAM on demand. |
 | **Shader** | `Shaders/NiagaraGSDataInterface.ush` | **Deprecated/empty** — see note below. |
-
-**`NiagaraGSEditor` (Editor)** — depends on `NiagaraGS` + the editor frameworks:
-
-| Area | Files | Role |
-|------|-------|------|
-| **Editor module** | `NiagaraGSEditorModule.{h,cpp}` | `IModuleInterface`; registers/unregisters the asset type actions. |
-| **Editor import** | `GaussianSplatAssetFactory.{h,cpp}` | `UFactory` that runs when a `.ply` is dropped into the Content Browser. (Auto-discovered via its CDO — no manual registration.) |
-| **Editor integration** | `GaussianSplatAssetTypeActions.{h,cpp}`, `GaussianSplatAssetEditor.{h,cpp}` | Content Browser type registration + a minimal summary asset editor (avoids rendering 100k+ structs). |
 
 ## Architecture & critical conventions
 
@@ -89,11 +84,12 @@ These were learned the hard way (the git history is a series of fixes for GPU
 stalls and stale bytecode). Respect them.
 
 ### Data flow
-1. A `.ply` is either **imported** as a `UGaussianSplatAsset` (drag into Content
-   Browser → `UGaussianSplatAssetFactory`) **or** referenced as a raw on-disk
-   path on the DI (`SourceFilePath`, no import). `SplatAsset` wins when both set.
-2. The parser converts each splat into UE space **at import/parse time** (not at
-   runtime) and stores `FGaussianSplatData`.
+1. The DI is configured with a raw on-disk path (`SourceFilePath`) — there is no
+   import step and no `UAsset` data source.
+2. The parser converts each splat into UE space **at parse time** (not at
+   runtime) and stores `FGaussianSplatData`. Parsed payloads are cached
+   process-wide, keyed by absolute path (`DiskCache`), so a file is parsed once
+   no matter how many DI objects/instances reference it.
 3. The DI resolves CPU splat data and, on the render thread, lazily uploads it
    into GPU `Buffer<float4>` SRVs owned by `FNDIGaussianSplatProxy`.
 4. Niagara GPU sim reads the buffers via dynamically-generated HLSL and spawns
@@ -115,6 +111,23 @@ stalls and stale bytecode). Respect them.
   uploaded once, lazily, on the exact proxy that the GPU reads from. A zeroed
   **fallback buffer** is always bound when real buffers aren't ready or were
   flushed, so the shader never sees a null SRV.
+- **The DI object bound to the GPU compute script is often a *different*,
+  UNCONFIGURED duplicate** (empty `SourceFilePath`) than the one the user
+  actually set up — a real Niagara quirk, not a bug in this plugin (CPU-bound
+  function calls always resolve against the live, correctly-configured object;
+  the GPU-bound copy does not reliably receive later changes). Self-heal on that
+  unconfigured object therefore falls back to `GLastLoadedDiskData` — a
+  process-wide "most recently loaded" pointer — so the GPU still gets real data.
+  **This is deliberately a single, coarse, "single active splat file assumed"
+  fallback, not scoped per-system**: removing it entirely breaks GPU upload for
+  every correctly-configured system (confirmed by regression — do not remove
+  it), but it also means an unrelated/never-configured DI can transiently show
+  another system's splats until something loads its own. `RequestGlobalFlush()`
+  (the BP node / scratchpad `FlushGPUBuffers`) clears it, so flushing after
+  deleting/reconfiguring a source drops the stale guess. Do not "fix" this by
+  reverting to a bare `nullptr` fallback without first confirming — with a live
+  editor test, GPU emitter rendering, not just the CPU path — that whatever
+  replaces it still reaches the actual GPU-bound duplicate object.
 - **Flushing VRAM is global, generation-based.** `RequestGlobalFlush()` /
   `FlushGPUBuffersVM` / the BP node bump a global atomic generation; each proxy
   releases its buffers once when the generation advances. Per-instance flush
@@ -189,9 +202,9 @@ just unzip into `Project/Plugins/` with no compile step), run the engine's
 - **Threading matters.** Be explicit about game vs render thread. Anything
   touching RHI/SRV/`FBufferRHIRef` belongs on the render thread or must be
   enqueued there.
-- **Keep editor-only code in the `NiagaraGSEditor` module** (not in the runtime
-  module) so packaged builds compile — see Build & environment above for the
-  `UCLASS`-vs-`#if WITH_EDITOR` rule.
+- **Keep editor-only `UCLASS`es in a dedicated Editor module** (not in the
+  runtime module) so packaged builds compile — see Build & environment above
+  for the `UCLASS`-vs-`#if WITH_EDITOR` rule.
 - When unsure about a Niagara/NDI API, consult the engine's Niagara source
   (allowlisted at `UE_5.6/.../Niagara/Source/`) rather than guessing.
 

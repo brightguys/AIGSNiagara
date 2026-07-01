@@ -13,10 +13,6 @@ void FNiagaraGSModule::StartupModule()
         TEXT("Shaders")
     );
     //AddShaderSourceDirectoryMapping(TEXT("/NiagaraGS"), PluginShaderDir);
-
-    // Editor-only registration (asset type actions, import factory) now lives in
-    // the separate NiagaraGSEditor module so this runtime module compiles for
-    // packaged (non-editor) game targets.
 }
 
 void FNiagaraGSModule::ShutdownModule()
