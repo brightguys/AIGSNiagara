@@ -42,6 +42,67 @@ TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> UNiagaraGSDataInterface:
 //  Data-source resolution (raw .ply on disk)
 // ─────────────────────────────────────────────────────────────────────────────
 
+namespace
+{
+    // Packs FGaussianSplatData into the GPU's float4 buffer layout ONCE, at load
+    // time — called from LoadOrParseDiskPayload (game thread for the synchronous
+    // initial load, a background thread-pool worker for ReloadFromDisk), never
+    // from the render thread. Pure CPU data transformation, no RHI/render-thread
+    // dependency, so there is no reason this needs to run on the render thread on
+    // every upload the way it used to. For a million-splat file this repacking
+    // (plus the ~192MB zero-fill/allocation for the SH buffer alone) was a real,
+    // measurable render-thread hitch on every reload, independent of the
+    // already-async disk fetch/parse — confirmed by regression.
+    void PackSplatsForGPU(
+        const TArray<FGaussianSplatData>& Splats,
+        TArray<FVector4f>& OutPositions,
+        TArray<FVector4f>& OutScales,
+        TArray<FVector4f>& OutRotations,
+        TArray<FVector4f>& OutColorOpacity,
+        TArray<FVector4f>& OutSH)
+    {
+        const int32 Count = Splats.Num();
+        constexpr int32 SH_VEC4S_PER_SPLAT = SH_VEC4_PER_SPLAT;   // 12
+
+        OutPositions.SetNumUninitialized(Count);
+        OutScales.SetNumUninitialized(Count);
+        OutRotations.SetNumUninitialized(Count);
+        OutColorOpacity.SetNumUninitialized(Count);
+        OutSH.SetNumZeroed(Count * SH_VEC4S_PER_SPLAT);
+
+        for (int32 i = 0; i < Count; ++i)
+        {
+            const FGaussianSplatData& S = Splats[i];
+
+            OutPositions[i]    = FVector4f(S.Position.X,    S.Position.Y,    S.Position.Z,    0.f);
+            OutScales[i]       = FVector4f(S.Scale.X,       S.Scale.Y,       S.Scale.Z,       0.f);
+            OutRotations[i]    = FVector4f(S.Orientation.X, S.Orientation.Y, S.Orientation.Z, S.Orientation.W);
+            OutColorOpacity[i] = FVector4f(S.Color.X,       S.Color.Y,       S.Color.Z,       S.Opacity);
+
+            // Re-interleave SH: PLY channel-major → GPU basis-major
+            const int32 NumCoefs = FMath::Min(S.SHCoefficients.Num(), SH_COEFFS_PER_SPLAT);
+            const int32 NumBases = NumCoefs / 3;
+            const int32 BaseIdx  = i * SH_VEC4S_PER_SPLAT;
+
+            for (int32 b = 0; b < NumBases; ++b)
+            {
+                const float r  = S.SHCoefficients[b];
+                const float g  = S.SHCoefficients[NumBases + b];
+                const float bv = S.SHCoefficients[2 * NumBases + b];
+
+                auto WriteFloat = [&](int32 FlatIndex, float Value)
+                {
+                    reinterpret_cast<float*>(&OutSH[BaseIdx + FlatIndex / 4])[FlatIndex % 4] = Value;
+                };
+
+                WriteFloat(b * 3 + 0, r);
+                WriteFloat(b * 3 + 1, g);
+                WriteFloat(b * 3 + 2, bv);
+            }
+        }
+    }
+}
+
 TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> UNiagaraGSDataInterface::LoadOrParseDiskPayload(
     const FString& ResolvedPath)
 {
@@ -75,6 +136,12 @@ TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> UNiagaraGSDataInterface:
     NewEntry->Splats = MoveTemp(Parsed);
     NewEntry->SHDegree = ParsedDegree;
     NewEntry->SourcePath = ResolvedPath;
+
+    // Pack once, here — not on the render thread on every upload (see
+    // PackSplatsForGPU's comment).
+    PackSplatsForGPU(NewEntry->Splats,
+        NewEntry->PackedPositions, NewEntry->PackedScales, NewEntry->PackedRotations,
+        NewEntry->PackedColorOpacity, NewEntry->PackedSH);
 
     {
         FScopeLock Lock(&DiskCacheCS);
@@ -242,15 +309,6 @@ const TArray<FGaussianSplatData>* UNiagaraGSDataInterface::GetSplatArray() const
         return &Payload->Splats;
     }
     return nullptr;
-}
-
-int32 UNiagaraGSDataInterface::GetResolvedSHDegree() const
-{
-    if (const FGSDiskSplatData* Payload = ResolvedDiskPayload())
-    {
-        return Payload->SHDegree;
-    }
-    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -956,9 +1014,11 @@ void UNiagaraGSDataInterface::SetShaderParameters(
             FScopeLock Lock(&DiskCacheCS);
             FreshPayload = GLastLoadedDiskData;
         }
-        if (FreshPayload.IsValid() && FreshPayload->Splats.Num() > 0)
+        if (FreshPayload.IsValid() && FreshPayload->PackedPositions.Num() > 0)
         {
-            SplatProxy.UploadData(FreshPayload->Splats.GetData(), FreshPayload->Splats.Num(), FreshPayload->SHDegree);
+            SplatProxy.UploadData(
+                FreshPayload->PackedPositions, FreshPayload->PackedScales, FreshPayload->PackedRotations,
+                FreshPayload->PackedColorOpacity, FreshPayload->PackedSH, FreshPayload->SHDegree);
             SplatProxy.RendersSinceReady = 0;
             SplatProxy.UploadedDataGeneration = DataGen;
             bUploadedThisCall = true;
@@ -972,13 +1032,17 @@ void UNiagaraGSDataInterface::SetShaderParameters(
     //    flush is not undone on the very next bind.
     if (!SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed)
     {
-        const TArray<FGaussianSplatData>* Splats = GetSplatArray();
-        if (Splats && Splats->Num() > 0)
+        if (const FGSDiskSplatData* Payload = ResolvedDiskPayload())
         {
-            SplatProxy.UploadData(Splats->GetData(), Splats->Num(), GetResolvedSHDegree());
-            SplatProxy.RendersSinceReady = 0;
-            SplatProxy.UploadedDataGeneration = DataGen;
-            bUploadedThisCall = true;
+            if (Payload->PackedPositions.Num() > 0)
+            {
+                SplatProxy.UploadData(
+                    Payload->PackedPositions, Payload->PackedScales, Payload->PackedRotations,
+                    Payload->PackedColorOpacity, Payload->PackedSH, Payload->SHDegree);
+                SplatProxy.RendersSinceReady = 0;
+                SplatProxy.UploadedDataGeneration = DataGen;
+                bUploadedThisCall = true;
+            }
         }
     }
 

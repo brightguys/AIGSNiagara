@@ -89,8 +89,20 @@ struct FNDIGaussianSplatProxy : public FNiagaraDataInterfaceProxy
 
     virtual int32 PerInstanceDataPassedToRenderThreadSize() const override { return 0; }
 
-    /** Upload the splat buffers (render thread). Resets bManuallyFlushed. */
-    void UploadData(const FGaussianSplatData* Data, int32 Count, int32 InSHDegree);
+    /**
+     * Upload the splat buffers (render thread). Resets bManuallyFlushed.
+     * Takes already GPU-packed float4 arrays (see FGSDiskSplatData /
+     * PackSplatsForGPU) — this does the RHI buffer creation + memcpy only, no
+     * per-splat CPU repacking, so the render-thread cost is just the
+     * unavoidable part of getting bytes onto the GPU.
+     */
+    void UploadData(
+        const TArray<FVector4f>& PackedPositions,
+        const TArray<FVector4f>& PackedScales,
+        const TArray<FVector4f>& PackedRotations,
+        const TArray<FVector4f>& PackedColorOpacity,
+        const TArray<FVector4f>& PackedSH,
+        int32 InSHDegree);
 
     /** Release the splat buffers, keep the fallback (render thread). */
     void ReleaseBuffers();

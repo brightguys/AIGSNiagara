@@ -211,7 +211,7 @@ stalls and stale bytecode). Respect them.
   `#include` of it caused Niagara compiler hangs/freezes. Do not reintroduce a
   static shader include; emit HLSL strings from C++ instead.
 
-### Parsing performance
+### Parsing & GPU-upload performance
 - Big `.ply` files have millions of splats × ~58 properties. The parser resolves
   every needed byte offset **once** in `ParseHeader` (`OffX`, `OffRest`, etc.)
   and reads by offset in the hot loop — never call `OffsetOf()` (linear search)
@@ -219,6 +219,29 @@ stalls and stale bytecode). Respect them.
 - Disk-loaded payloads are cached **process-wide** keyed by absolute path
   (`DiskCache`, guarded by `DiskCacheCS`) so a file is parsed exactly once even
   though Niagara creates/duplicates many transient DI objects.
+- **The CPU→GPU float4 repacking (`PackSplatsForGPU`) happens ONCE, at load
+  time, in `LoadOrParseDiskPayload` — never in `FNDIGaussianSplatProxy::UploadData`
+  (render thread).** This used to be a per-splat CPU loop (plus a `SetNumZeroed`
+  allocation of `Count × SH_VEC4_PER_SPLAT` float4s — ~192MB for a 1M-splat file's
+  SH buffer alone) run synchronously on the render thread on every single upload,
+  including every `ReloadFromDisk()` swap — a real, measurable hitch **independent
+  of** the disk fetch/parse (which was already correctly backgrounded), confirmed
+  by regression: reload felt just as heavy as the full `ReinitializeSystem` path
+  it was meant to avoid. Packed float4 arrays now live on `FGSDiskSplatData`
+  (`PackedPositions/Scales/Rotations/ColorOpacity/SH`) alongside the parsed
+  `Splats`, computed once per file (same "parse once, cache process-wide"
+  cache-hit path already used for parsing) regardless of which thread resolves a
+  cache miss. `UploadData()` now does RHI buffer creation + a straight `memcpy`
+  only — the unavoidable part of getting bytes onto the GPU. If you add a new
+  per-splat GPU attribute, pack it here too; do not reintroduce a per-splat loop
+  inside `UploadData`.
+- Remaining upload cost is proportional to splat count (buffer creation + memcpy
+  for 5 buffers) and is paid once per swap on the render thread — there is no
+  known way to make RHI resource creation itself free. If reload cadence is ever
+  high enough for this to matter, the next lever is pre-allocating buffers for a
+  max splat count and reusing them (`RHIUpdateBuffer` in place) instead of
+  releasing + recreating on every swap — not implemented; would trade fixed
+  extra VRAM for less RHI churn.
 
 ### Coordinate / value conversion (in `GaussianSplatPLYParser.cpp`)
 Applied once at parse time:

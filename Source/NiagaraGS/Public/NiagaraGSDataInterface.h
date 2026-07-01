@@ -21,6 +21,19 @@ struct FGSDiskSplatData
     TArray<FGaussianSplatData> Splats;
     int32   SHDegree = 0;
     FString SourcePath;   // absolute path this payload was parsed from (cache key)
+
+    // GPU-ready float4 buffers, packed ONCE here (whichever thread resolves a
+    // cache miss — game thread for the synchronous initial load, a background
+    // thread pool worker for ReloadFromDisk) rather than every time a proxy
+    // uploads. UploadData() just memcpy's these directly. See PackSplatsForGPU()
+    // in NiagaraGSDataInterface.cpp — repacking a million-splat file on the
+    // render thread on every reload was a real, measurable hitch independent of
+    // the (already-async) disk fetch/parse.
+    TArray<FVector4f> PackedPositions;
+    TArray<FVector4f> PackedScales;
+    TArray<FVector4f> PackedRotations;
+    TArray<FVector4f> PackedColorOpacity;
+    TArray<FVector4f> PackedSH;
 };
 
 // Broadcast on the game thread once a ReloadFromDisk() call completes or fails.
@@ -208,7 +221,6 @@ private:
     void EnsureSplatDataLoaded();
 
     const TArray<FGaussianSplatData>* GetSplatArray() const;
-    int32 GetResolvedSHDegree() const;
 
     // This DI's own resolved handle into the shared disk cache.
     TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> ResolvedDiskData;
