@@ -78,60 +78,27 @@ void FNDIGaussianSplatProxy::ReleaseBuffers()
 // ─────────────────────────────────────────────────────────────────────────────
 
 void FNDIGaussianSplatProxy::UploadData(
-    const FGaussianSplatData* Data, int32 Count, int32 InSHDegree)
+    const TArray<FVector4f>& PackedPositions,
+    const TArray<FVector4f>& PackedScales,
+    const TArray<FVector4f>& PackedRotations,
+    const TArray<FVector4f>& PackedColorOpacity,
+    const TArray<FVector4f>& PackedSH,
+    int32 InSHDegree)
 {
     check(IsInRenderingThread());
     InitFallbackBuffer();
 
     ReleaseBuffers();
 
-    if (!Data || Count <= 0)
+    const int32 Count = PackedPositions.Num();
+    if (Count <= 0)
     {
         return;
     }
 
-    constexpr int32 SH_VEC4S_PER_SPLAT = SH_VEC4_PER_SPLAT;   // 12
-
-    TArray<FVector4f> PackedPositions, PackedScales, PackedRotations, PackedColorOpacity;
-    PackedPositions.SetNumUninitialized(Count);
-    PackedScales.SetNumUninitialized(Count);
-    PackedRotations.SetNumUninitialized(Count);
-    PackedColorOpacity.SetNumUninitialized(Count);
-
-    TArray<FVector4f> PackedSH;
-    PackedSH.SetNumZeroed(Count * SH_VEC4S_PER_SPLAT);
-
-    for (int32 i = 0; i < Count; ++i)
-    {
-        const FGaussianSplatData& S = Data[i];
-
-        PackedPositions[i]    = FVector4f(S.Position.X,    S.Position.Y,    S.Position.Z,    0.f);
-        PackedScales[i]       = FVector4f(S.Scale.X,       S.Scale.Y,       S.Scale.Z,       0.f);
-        PackedRotations[i]    = FVector4f(S.Orientation.X, S.Orientation.Y, S.Orientation.Z, S.Orientation.W);
-        PackedColorOpacity[i] = FVector4f(S.Color.X,       S.Color.Y,       S.Color.Z,       S.Opacity);
-
-        // Re-interleave SH: PLY channel-major → GPU basis-major
-        const int32 NumCoefs = FMath::Min(S.SHCoefficients.Num(), SH_COEFFS_PER_SPLAT);
-        const int32 NumBases = NumCoefs / 3;
-        const int32 BaseIdx  = i * SH_VEC4S_PER_SPLAT;
-
-        for (int32 b = 0; b < NumBases; ++b)
-        {
-            const float r  = S.SHCoefficients[b];
-            const float g  = S.SHCoefficients[NumBases + b];
-            const float bv = S.SHCoefficients[2 * NumBases + b];
-
-            auto WriteFloat = [&](int32 FlatIndex, float Value)
-            {
-                reinterpret_cast<float*>(&PackedSH[BaseIdx + FlatIndex / 4])[FlatIndex % 4] = Value;
-            };
-
-            WriteFloat(b * 3 + 0, r);
-            WriteFloat(b * 3 + 1, g);
-            WriteFloat(b * 3 + 2, bv);
-        }
-    }
-
+    // Pure RHI work from here: the CPU-side per-splat packing already happened
+    // once, at load time (PackSplatsForGPU, off the render thread — see
+    // FGSDiskSplatData). No per-splat loop on the render thread.
     FRHICommandListImmediate& CmdList = FRHICommandListExecutor::GetImmediateCommandList();
 
     using NiagaraGSGPULocal::CreateFloat4Buffer;
@@ -146,6 +113,7 @@ void FNDIGaussianSplatProxy::UploadData(
     bBuffersReady    = true;
     bManuallyFlushed = false;
 
+    constexpr int32 SH_VEC4S_PER_SPLAT = SH_VEC4_PER_SPLAT;   // 12
     const int64 TotalBytes = (int64)Count * sizeof(FVector4f) * (4 + SH_VEC4S_PER_SPLAT);
     UE_LOG(LogTemp, Log,
         TEXT("NiagaraGS: Uploaded %d splats (~%lld MB VRAM, SH degree %d)"),

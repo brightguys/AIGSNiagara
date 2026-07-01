@@ -21,6 +21,19 @@ struct FGSDiskSplatData
     TArray<FGaussianSplatData> Splats;
     int32   SHDegree = 0;
     FString SourcePath;   // absolute path this payload was parsed from (cache key)
+
+    // GPU-ready float4 buffers, packed ONCE here (whichever thread resolves a
+    // cache miss — game thread for the synchronous initial load, a background
+    // thread pool worker for ReloadFromDisk) rather than every time a proxy
+    // uploads. UploadData() just memcpy's these directly. See PackSplatsForGPU()
+    // in NiagaraGSDataInterface.cpp — repacking a million-splat file on the
+    // render thread on every reload was a real, measurable hitch independent of
+    // the (already-async) disk fetch/parse.
+    TArray<FVector4f> PackedPositions;
+    TArray<FVector4f> PackedScales;
+    TArray<FVector4f> PackedRotations;
+    TArray<FVector4f> PackedColorOpacity;
+    TArray<FVector4f> PackedSH;
 };
 
 // Broadcast on the game thread once a ReloadFromDisk() call completes or fails.
@@ -172,6 +185,13 @@ public:
     // Bumps the global flush generation; every live Gaussian Splat proxy releases
     // its VRAM the next time it renders. (Per-instance targeting was removed with
     // the per-instance lifecycle; use a separate DI/component per system to isolate.)
+    // Static + BlueprintCallable: Blueprint can call this directly with no target
+    // object needed (no Cast required), now that GetDataInterface(...) → Cast to
+    // this class works (see the BlueprintType note above). The pre-existing
+    // UNiagaraGSBlueprintLibrary::FlushGaussianSplatBuffers(Component) wrapper is
+    // unaffected and still works the same way.
+    UFUNCTION(BlueprintCallable, Category = "Gaussian Splats",
+        meta = (DisplayName = "Flush Gaussian Splat GPU Buffers"))
     static void RequestGlobalFlush();
 
     // Blueprint helper entry point (UNiagaraGSBlueprintLibrary). The component is
@@ -201,7 +221,6 @@ private:
     void EnsureSplatDataLoaded();
 
     const TArray<FGaussianSplatData>* GetSplatArray() const;
-    int32 GetResolvedSHDegree() const;
 
     // This DI's own resolved handle into the shared disk cache.
     TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> ResolvedDiskData;

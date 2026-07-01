@@ -75,7 +75,7 @@ Source/
 | **PLY parsing** | `GaussianSplatPLYParser.{h,cpp}` | Stateless `.ply` → `TArray<FGaussianSplatData>` parser (ASCII + binary LE), SH-degree detection, coordinate conversion. |
 | **Niagara DI (game thread)** | `NiagaraGSDataInterface.{h,cpp}` | The custom `UNiagaraDataInterface`. CPU VM bindings, dynamic GPU HLSL generation, data-source resolution, flush logic, async hot reload (`ReloadFromDisk`). |
 | **Niagara DI (render thread)** | `NiagaraGSDataInterfaceGPU.{h,cpp}` | `FNDIGaussianSplatProxy`: owns the GPU buffers/SRVs, upload + release. Shader parameter struct. |
-| **Blueprint API** | `NiagaraGSBlueprintLibrary.{h,cpp}` | `FlushGaussianSplatBuffers` BP node to free VRAM on demand. |
+| **Blueprint API** | `NiagaraGSBlueprintLibrary.{h,cpp}` | `FlushGaussianSplatBuffers` BP node to free VRAM on demand; `ReactivateGaussianSplatSystem` to make a completed `ReloadFromDisk()` visible (see DI rules below — plain `ResetSystem()` is not enough). |
 | **Shader** | `Shaders/NiagaraGSDataInterface.ush` | **Deprecated/empty** — see note below. |
 
 ## Architecture & critical conventions
@@ -152,9 +152,41 @@ stalls and stale bytecode). Respect them.
   the fallback above. `ReloadRequestCounter`, by contrast, IS per-instance (plain
   `uint64`, game-thread-only) — it only discards a stale out-of-order completion
   on the same object, so it doesn't need to be global.
+  **On a generation-mismatch re-upload, read `GLastLoadedDiskData` directly —
+  never `GetSplatArray()`/`this`.** Confirmed by regression: after one successful
+  load, the GPU-bound duplicate already has a non-empty (but stale)
+  `SourceFilePath`/`ResolvedDiskData` from before the reload — Niagara never
+  refreshes a duplicate's properties once created, only `CopyToInternal`s them at
+  creation time. `GetSplatArray()` on that stale duplicate does NOT fail (which
+  would at least be visible); it "succeeds" by resolving the OLD file's still-live
+  `DiskCache` entry (never evicted, keyed by the duplicate's own stale path) and
+  silently re-uploads the same old data. Symptom looked like "reload does
+  nothing": `OnReloadComplete` fired with the correct new splat count
+  (CPU/VM functions always resolve against the live object, so that part is
+  correct), but the GPU buffer never changed. `GLastLoadedDiskData` is reliably
+  the freshest payload as of the most recent successful load, so bypass per-object
+  resolution entirely for this specific branch.
   `ReloadFromDisk` only swaps CPU/GPU data; it does not reset the Niagara system,
   so the GPU spawn burst count (set once by the emitter) won't itself change —
   react to `OnReloadComplete` and call `ResetSystem()` on the owning component.
+- **Making the new data visible needs `Activate(true)` AND `ReregisterComponent()`
+  — `ResetSystem()` alone is NOT enough, confirmed by regression.** After the
+  `GLastLoadedDiskData` fix above, the GPU buffer demonstrably gets the new splats
+  (`UE_LOG` "Uploaded N splats" fires with the correct new count right after
+  `ReloadFromDisk`, before touching any reset) — but calling `ResetSystem()`
+  (`Activate(true)` alone) from Blueprint still visually kept showing the old
+  splats. Only the Niagara Component's Details-panel "Reset" button worked, and
+  its handler (`FNiagaraComponentDetails::OnResetSelectedSystem` in
+  `NiagaraComponentDetails.cpp`) does `Activate(true)` **then**
+  `ReregisterComponent()` — the extra step actually responsible for making
+  particles respawn against the new buffer (particles copy their attributes from
+  the DI buffer once, at spawn time — see `AutoFlushAfterRenders` above — so nothing
+  new appears until something forces an actual respawn). `ReregisterComponent()`
+  is not `BlueprintCallable` in the engine, so
+  `UNiagaraGSBlueprintLibrary::ReactivateGaussianSplatSystem(Component)` wraps
+  both calls for Blueprint. Do not "simplify" this back down to just
+  `ResetSystem()`/`Activate(true)` without re-confirming in a live GPU-emitter
+  test — the `ReregisterComponent()` call is load-bearing.
 - **The `UCLASS` needs `BlueprintType`, or none of this is reachable from
   Blueprint.** Blueprint's "Cast To" node requires the target class to declare
   `BlueprintType`; without it there is no way to cast a generic
@@ -179,7 +211,7 @@ stalls and stale bytecode). Respect them.
   `#include` of it caused Niagara compiler hangs/freezes. Do not reintroduce a
   static shader include; emit HLSL strings from C++ instead.
 
-### Parsing performance
+### Parsing & GPU-upload performance
 - Big `.ply` files have millions of splats × ~58 properties. The parser resolves
   every needed byte offset **once** in `ParseHeader` (`OffX`, `OffRest`, etc.)
   and reads by offset in the hot loop — never call `OffsetOf()` (linear search)
@@ -187,6 +219,29 @@ stalls and stale bytecode). Respect them.
 - Disk-loaded payloads are cached **process-wide** keyed by absolute path
   (`DiskCache`, guarded by `DiskCacheCS`) so a file is parsed exactly once even
   though Niagara creates/duplicates many transient DI objects.
+- **The CPU→GPU float4 repacking (`PackSplatsForGPU`) happens ONCE, at load
+  time, in `LoadOrParseDiskPayload` — never in `FNDIGaussianSplatProxy::UploadData`
+  (render thread).** This used to be a per-splat CPU loop (plus a `SetNumZeroed`
+  allocation of `Count × SH_VEC4_PER_SPLAT` float4s — ~192MB for a 1M-splat file's
+  SH buffer alone) run synchronously on the render thread on every single upload,
+  including every `ReloadFromDisk()` swap — a real, measurable hitch **independent
+  of** the disk fetch/parse (which was already correctly backgrounded), confirmed
+  by regression: reload felt just as heavy as the full `ReinitializeSystem` path
+  it was meant to avoid. Packed float4 arrays now live on `FGSDiskSplatData`
+  (`PackedPositions/Scales/Rotations/ColorOpacity/SH`) alongside the parsed
+  `Splats`, computed once per file (same "parse once, cache process-wide"
+  cache-hit path already used for parsing) regardless of which thread resolves a
+  cache miss. `UploadData()` now does RHI buffer creation + a straight `memcpy`
+  only — the unavoidable part of getting bytes onto the GPU. If you add a new
+  per-splat GPU attribute, pack it here too; do not reintroduce a per-splat loop
+  inside `UploadData`.
+- Remaining upload cost is proportional to splat count (buffer creation + memcpy
+  for 5 buffers) and is paid once per swap on the render thread — there is no
+  known way to make RHI resource creation itself free. If reload cadence is ever
+  high enough for this to matter, the next lever is pre-allocating buffers for a
+  max splat count and reusing them (`RHIUpdateBuffer` in place) instead of
+  releasing + recreating on every swap — not implemented; would trade fixed
+  extra VRAM for less RHI churn.
 
 ### Coordinate / value conversion (in `GaussianSplatPLYParser.cpp`)
 Applied once at parse time:
