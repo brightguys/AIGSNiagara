@@ -15,6 +15,7 @@
 #include "RenderingThread.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
+#include "Async/Async.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Static member definitions
@@ -31,6 +32,7 @@ const FName UNiagaraGSDataInterface::Name_GetSplatSHCoefficients(TEXT("GetSplatS
 const FName UNiagaraGSDataInterface::Name_FlushGPUBuffers(TEXT("FlushGPUBuffers"));
 
 TAtomic<uint64> UNiagaraGSDataInterface::GlobalFlushGeneration(0);
+TAtomic<uint64> UNiagaraGSDataInterface::GDataGeneration(0);
 
 FCriticalSection UNiagaraGSDataInterface::DiskCacheCS;
 TMap<FString, TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>> UNiagaraGSDataInterface::DiskCache;
@@ -39,6 +41,53 @@ TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> UNiagaraGSDataInterface:
 // ─────────────────────────────────────────────────────────────────────────────
 //  Data-source resolution (raw .ply on disk)
 // ─────────────────────────────────────────────────────────────────────────────
+
+TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> UNiagaraGSDataInterface::LoadOrParseDiskPayload(
+    const FString& ResolvedPath)
+{
+    // Process-wide cache hit → instant (no re-parse). THIS is what stops the
+    // per-instance re-parsing churn for big files.
+    {
+        FScopeLock Lock(&DiskCacheCS);
+        if (TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>* Found = DiskCache.Find(ResolvedPath))
+        {
+            GLastLoadedDiskData = *Found;
+            return *Found;
+        }
+    }
+
+    // Cache miss → parse once (the only place that pays the file-read cost). Safe
+    // off the game thread — the parser is stateless (see GaussianSplatPLYParser.h).
+    TArray<FGaussianSplatData> Parsed;
+    int32 ParsedDegree = 0;
+    FString Error;
+
+    if (!FGaussianSplatPLYParser::ParsePLY(ResolvedPath, Parsed, ParsedDegree, Error))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("NiagaraGS: Failed to load '%s' from disk: %s"),
+            *ResolvedPath, *Error);
+        return nullptr;
+    }
+
+    TSharedPtr<FGSDiskSplatData, ESPMode::ThreadSafe> NewEntry =
+        MakeShared<FGSDiskSplatData, ESPMode::ThreadSafe>();
+    NewEntry->Splats = MoveTemp(Parsed);
+    NewEntry->SHDegree = ParsedDegree;
+    NewEntry->SourcePath = ResolvedPath;
+
+    {
+        FScopeLock Lock(&DiskCacheCS);
+        DiskCache.Add(ResolvedPath, NewEntry);
+        GLastLoadedDiskData = NewEntry;
+    }
+
+    UE_LOG(LogTemp, Log,
+        TEXT("NiagaraGS: Loaded %d splats from disk '%s' (SH degree %d) — cached process-wide"),
+        NewEntry->Splats.Num(), *ResolvedPath, NewEntry->SHDegree);
+
+    return NewEntry;
+}
 
 void UNiagaraGSDataInterface::EnsureSplatDataLoaded()
 {
@@ -62,49 +111,85 @@ void UNiagaraGSDataInterface::EnsureSplatDataLoaded()
         return;
     }
 
-    // Process-wide cache hit → instant (no re-parse). THIS is what stops the
-    // per-instance re-parsing churn for big files.
+    ResolvedDiskData = LoadOrParseDiskPayload(ResolvedPath);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Hot reload (async fetch+parse off the game thread, atomic swap on completion)
+// ─────────────────────────────────────────────────────────────────────────────
+
+void UNiagaraGSDataInterface::ReloadFromDisk(const FString& NewSourceFilePath)
+{
+    const FString PathToLoad = NewSourceFilePath.IsEmpty() ? SourceFilePath : NewSourceFilePath;
+    if (PathToLoad.IsEmpty())
     {
-        FScopeLock Lock(&DiskCacheCS);
-        if (TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>* Found = DiskCache.Find(ResolvedPath))
+        UE_LOG(LogTemp, Warning, TEXT("NiagaraGS: ReloadFromDisk — no path set"));
+        OnReloadComplete.Broadcast(false, 0);
+        return;
+    }
+    SourceFilePath = PathToLoad;
+
+    FString ResolvedPath = PathToLoad;
+    if (FPaths::IsRelative(ResolvedPath))
+    {
+        ResolvedPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir(), ResolvedPath);
+    }
+
+    // Bump before dispatching so a completion that arrives after a newer reload
+    // was already requested can recognize itself as stale and discard.
+    const uint64 RequestId = ++ReloadRequestCounter;
+
+    UE_LOG(LogTemp, Log,
+        TEXT("NiagaraGS: ReloadFromDisk — queuing async load of '%s' (request %llu, DI=0x%p)"),
+        *ResolvedPath, RequestId, this);
+
+    TWeakObjectPtr<UNiagaraGSDataInterface> WeakThis(this);
+    Async(EAsyncExecution::ThreadPool, [WeakThis, ResolvedPath, RequestId]()
+    {
+        // Background thread: the expensive file read + parse never touches the
+        // game thread.
+        TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> Result =
+            LoadOrParseDiskPayload(ResolvedPath);
+
+        AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, RequestId]()
         {
-            ResolvedDiskData = *Found;
-            GLastLoadedDiskData = *Found;
-            return;
-        }
-    }
+            if (UNiagaraGSDataInterface* This = WeakThis.Get())
+            {
+                This->ApplyReloadResult(RequestId, Result);
+            }
+        });
+    });
+}
 
-    // Cache miss → parse once (the only place that pays the file-read cost).
-    TArray<FGaussianSplatData> Parsed;
-    int32 ParsedDegree = 0;
-    FString Error;
-
-    if (FGaussianSplatPLYParser::ParsePLY(ResolvedPath, Parsed, ParsedDegree, Error))
+void UNiagaraGSDataInterface::ApplyReloadResult(
+    uint64 RequestId, TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> NewPayload)
+{
+    // Discard out-of-order completions: a newer ReloadFromDisk() call on this
+    // same instance has already superseded this one.
+    if (RequestId != ReloadRequestCounter)
     {
-        TSharedPtr<FGSDiskSplatData, ESPMode::ThreadSafe> NewEntry =
-            MakeShared<FGSDiskSplatData, ESPMode::ThreadSafe>();
-        NewEntry->Splats = MoveTemp(Parsed);
-        NewEntry->SHDegree = ParsedDegree;
-        NewEntry->SourcePath = ResolvedPath;
-
-        {
-            FScopeLock Lock(&DiskCacheCS);
-            DiskCache.Add(ResolvedPath, NewEntry);
-            GLastLoadedDiskData = NewEntry;
-        }
-        ResolvedDiskData = NewEntry;
-
-        UE_LOG(LogTemp, Log,
-            TEXT("NiagaraGS: Loaded %d splats from disk '%s' (SH degree %d) — cached process-wide"),
-            ResolvedDiskData->Splats.Num(), *ResolvedPath, ResolvedDiskData->SHDegree);
+        UE_LOG(LogTemp, Verbose,
+            TEXT("NiagaraGS: ReloadFromDisk — discarding stale result (request %llu, current %llu)"),
+            RequestId, ReloadRequestCounter);
+        return;
     }
-    else
+
+    if (!NewPayload.IsValid())
     {
-        ResolvedDiskData.Reset();
-        UE_LOG(LogTemp, Error,
-            TEXT("NiagaraGS: Failed to load '%s' from disk: %s"),
-            *ResolvedPath, *Error);
+        OnReloadComplete.Broadcast(false, 0);
+        return;
     }
+
+    // The atomic swap: nothing about the currently-rendered data changes until
+    // this line. Old splats keep rendering unchanged throughout the fetch+parse.
+    ResolvedDiskData = NewPayload;
+    GDataGeneration.IncrementExchange();
+
+    UE_LOG(LogTemp, Log,
+        TEXT("NiagaraGS: ReloadFromDisk — swapped in %d splats from '%s' (DI=0x%p)"),
+        NewPayload->Splats.Num(), *NewPayload->SourcePath, this);
+
+    OnReloadComplete.Broadcast(true, NewPayload->Splats.Num());
 }
 
 const FGSDiskSplatData* UNiagaraGSDataInterface::ResolvedDiskPayload() const
@@ -228,6 +313,11 @@ void UNiagaraGSDataInterface::RequestGlobalFlush()
 uint64 UNiagaraGSDataInterface::GetFlushGeneration()
 {
     return GlobalFlushGeneration.Load();
+}
+
+uint64 UNiagaraGSDataInterface::GetDataGeneration()
+{
+    return GDataGeneration.Load();
 }
 
 bool UNiagaraGSDataInterface::FlushBuffersForSystemInstance(FNiagaraSystemInstanceID InstanceID)
@@ -814,9 +904,10 @@ void UNiagaraGSDataInterface::SetShaderParameters(
     {
         SplatProxy.bDiagLogged = true;
         const TArray<FGaussianSplatData>* DiagSplats = GetSplatArray();
-        UE_LOG(LogTemp, Warning, TEXT("NiagaraGS: SetShaderParameters DIAG — bReady=%d bFlushed=%d gen=%llu/%llu SplatArray=%s count=%d SourcePath='%s' DI=0x%p Proxy=0x%p"),
+        UE_LOG(LogTemp, Warning, TEXT("NiagaraGS: SetShaderParameters DIAG — bReady=%d bFlushed=%d flushGen=%llu/%llu dataGen=%llu/%llu SplatArray=%s count=%d SourcePath='%s' DI=0x%p Proxy=0x%p"),
             SplatProxy.bBuffersReady ? 1 : 0, SplatProxy.bManuallyFlushed ? 1 : 0,
             (uint64)GetFlushGeneration(), (uint64)SplatProxy.FlushedGeneration,
+            (uint64)GetDataGeneration(), (uint64)SplatProxy.UploadedDataGeneration,
             DiagSplats ? TEXT("VALID") : TEXT("NULL"), DiagSplats ? DiagSplats->Num() : -1,
             *SourceFilePath, this, &SplatProxy);
     }
@@ -836,12 +927,33 @@ void UNiagaraGSDataInterface::SetShaderParameters(
         SplatProxy.bManuallyFlushed = true;
     }
 
+    bool bUploadedThisCall = false;
+
+    // 1b) Hot-reload re-upload: a completed ReloadFromDisk() bumps a global data
+    //    generation (see its declaration comment for why this is global rather
+    //    than per-instance). If it has advanced past what THIS proxy last
+    //    uploaded, force a fresh upload even though buffers are already ready —
+    //    UploadData() releases the old buffers and creates new ones sized to the
+    //    new splat count. This is the one bounded render-thread cost of a swap;
+    //    the game thread never blocked on the fetch/parse that produced it.
+    const uint64 DataGen = GetDataGeneration();
+    if (SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed && DataGen != SplatProxy.UploadedDataGeneration)
+    {
+        const TArray<FGaussianSplatData>* Splats = GetSplatArray();
+        if (Splats && Splats->Num() > 0)
+        {
+            SplatProxy.UploadData(Splats->GetData(), Splats->Num(), GetResolvedSHDegree());
+            SplatProxy.RendersSinceReady = 0;
+            SplatProxy.UploadedDataGeneration = DataGen;
+            bUploadedThisCall = true;
+        }
+    }
+
     // 2) Self-heal: upload the buffers once from the resolved CPU data (this DI's
     //    handle, the process-wide path cache, or the last-loaded fallback). This
     //    is what puts real data on the GPU, and it runs BEFORE
     //    the spawn dispatch reads them. Skipped once intentionally flushed so a
     //    flush is not undone on the very next bind.
-    bool bUploadedThisCall = false;
     if (!SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed)
     {
         const TArray<FGaussianSplatData>* Splats = GetSplatArray();
@@ -849,6 +961,7 @@ void UNiagaraGSDataInterface::SetShaderParameters(
         {
             SplatProxy.UploadData(Splats->GetData(), Splats->Num(), GetResolvedSHDegree());
             SplatProxy.RendersSinceReady = 0;
+            SplatProxy.UploadedDataGeneration = DataGen;
             bUploadedThisCall = true;
         }
     }

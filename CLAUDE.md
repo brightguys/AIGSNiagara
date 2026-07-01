@@ -73,7 +73,7 @@ Source/
 | **Module** | `NiagaraGSModule.{h,cpp}` | `IModuleInterface`; registers the shader dir. |
 | **Splat data model** | `GaussianSplatData.h` | `FGaussianSplatData` USTRUCT (one splat) + GPU packing constants. |
 | **PLY parsing** | `GaussianSplatPLYParser.{h,cpp}` | Stateless `.ply` → `TArray<FGaussianSplatData>` parser (ASCII + binary LE), SH-degree detection, coordinate conversion. |
-| **Niagara DI (game thread)** | `NiagaraGSDataInterface.{h,cpp}` | The custom `UNiagaraDataInterface`. CPU VM bindings, dynamic GPU HLSL generation, data-source resolution, flush logic. |
+| **Niagara DI (game thread)** | `NiagaraGSDataInterface.{h,cpp}` | The custom `UNiagaraDataInterface`. CPU VM bindings, dynamic GPU HLSL generation, data-source resolution, flush logic, async hot reload (`ReloadFromDisk`). |
 | **Niagara DI (render thread)** | `NiagaraGSDataInterfaceGPU.{h,cpp}` | `FNDIGaussianSplatProxy`: owns the GPU buffers/SRVs, upload + release. Shader parameter struct. |
 | **Blueprint API** | `NiagaraGSBlueprintLibrary.{h,cpp}` | `FlushGaussianSplatBuffers` BP node to free VRAM on demand. |
 | **Shader** | `Shaders/NiagaraGSDataInterface.ush` | **Deprecated/empty** — see note below. |
@@ -95,6 +95,12 @@ stalls and stale bytecode). Respect them.
 4. Niagara GPU sim reads the buffers via dynamically-generated HLSL and spawns
    one particle per splat. SH evaluation against camera direction happens in the
    material.
+5. `ReloadFromDisk(NewPath)` hot-swaps the source without a game-thread hitch:
+   the fetch+parse runs on a background thread pool (`Async`/`AsyncTask`), and
+   only the completion (game thread) atomically swaps `ResolvedDiskData` and
+   bumps `GDataGeneration`. The currently-rendered data is untouched until that
+   swap — no "goes blank" gap. See the DI rules below for how the GPU side picks
+   this up.
 
 ### The Niagara DI rules (do not break these)
 - **`PerInstanceDataSize()` is intentionally 0.** Niagara never runs the
@@ -133,6 +139,22 @@ stalls and stale bytecode). Respect them.
   releases its buffers once when the generation advances. Per-instance flush
   targeting was removed with the per-instance lifecycle — use a separate
   DI/component per system to isolate.
+- **Hot reload (`ReloadFromDisk`) re-uploads via the same global-generation
+  pattern as flush, for the same reason.** `ApplyReloadResult` (the async
+  completion, game thread) bumps `GDataGeneration` — a global `TAtomic<uint64>`,
+  not a per-instance counter — because the GPU-bound object `SetShaderParameters`
+  runs on may not be the instance `ReloadFromDisk()` was called on (see the
+  GLastLoadedDiskData bullet above). `SetShaderParameters` re-uploads once when it
+  sees the generation advance past the proxy's own `UploadedDataGeneration`, even
+  if buffers are already ready. Trade-off: reloading any one system also makes
+  every other unrelated system's proxy redundantly re-upload its own unchanged
+  data once — accepted for the same "single active splat file assumed" reason as
+  the fallback above. `ReloadRequestCounter`, by contrast, IS per-instance (plain
+  `uint64`, game-thread-only) — it only discards a stale out-of-order completion
+  on the same object, so it doesn't need to be global.
+  `ReloadFromDisk` only swaps CPU/GPU data; it does not reset the Niagara system,
+  so the GPU spawn burst count (set once by the emitter) won't itself change —
+  react to `OnReloadComplete` and call `ResetSystem()` on the owning component.
 - **RHI release is marshalled to the render thread.** GC may run the proxy
   destructor on the game thread, so RHI releases go through
   `ENQUEUE_RENDER_COMMAND`. Keep this pattern for any new GPU resource.
