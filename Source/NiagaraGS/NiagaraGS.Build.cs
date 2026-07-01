@@ -30,9 +30,10 @@ public class NiagaraGS : ModuleRules
             "NiagaraShader",
         });
 
-        // Editor-only code (import factory, asset type actions, asset editor)
-        // lives in the separate NiagaraGSEditor module, so this runtime module
-        // has no editor framework dependencies and compiles for packaged builds.
+        // No editor framework dependencies — this module must compile for
+        // packaged (non-editor) game targets. If editor-only tooling (e.g. an
+        // asset import factory) is added later, put it in a new separate
+        // Editor-type module rather than here — see CLAUDE.md.
 
         // The module's own Private folder is already on the include path, so no
         // extra PrivateIncludePaths entry is needed here.

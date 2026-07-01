@@ -19,11 +19,6 @@
             "Name": "NiagaraGS",
             "Type": "Runtime",
             "LoadingPhase": "PostEngineInit"
-        },
-        {
-            "Name": "NiagaraGSEditor",
-            "Type": "Editor",
-            "LoadingPhase": "PostEngineInit"
         }
     ],
     "Plugins": [

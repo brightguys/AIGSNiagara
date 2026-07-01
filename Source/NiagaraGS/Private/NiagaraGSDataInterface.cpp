@@ -37,18 +37,11 @@ TMap<FString, TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>> UNiagaraG
 TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> UNiagaraGSDataInterface::GLastLoadedDiskData;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Data-source resolution (imported asset OR raw .ply on disk)
+//  Data-source resolution (raw .ply on disk)
 // ─────────────────────────────────────────────────────────────────────────────
 
 void UNiagaraGSDataInterface::EnsureSplatDataLoaded()
 {
-    // Asset wins; nothing to load from disk.
-    if (SplatAsset)
-    {
-        ResolvedDiskData.Reset();
-        return;
-    }
-
     if (SourceFilePath.IsEmpty())
     {
         ResolvedDiskData.Reset();
@@ -141,9 +134,12 @@ const FGSDiskSplatData* UNiagaraGSDataInterface::ResolvedDiskPayload() const
         }
     }
 
-    // Last resort: this DI is unconfigured (no asset, no path) — the GPU compute
-    // script's DI is typically such an object. Use the most recently loaded payload
-    // so the GPU still renders real data. (Single active splat file assumed.)
+    // Last resort: this DI has an empty SourceFilePath — the GPU compute script's
+    // DI is typically such an object (see GLastLoadedDiskData's declaration
+    // comment for why). Use the most recently loaded payload so the GPU still
+    // renders real data. NOTE: this is a process-wide guess (single active splat
+    // file assumed) — call RequestGlobalFlush() (the Blueprint node / scratchpad
+    // FlushGPUBuffers) after deleting/reconfiguring a source to drop it.
     {
         FScopeLock Lock(&DiskCacheCS);
         if (GLastLoadedDiskData.IsValid())
@@ -156,10 +152,6 @@ const FGSDiskSplatData* UNiagaraGSDataInterface::ResolvedDiskPayload() const
 
 const TArray<FGaussianSplatData>* UNiagaraGSDataInterface::GetSplatArray() const
 {
-    if (SplatAsset)
-    {
-        return &SplatAsset->SplatData;
-    }
     if (const FGSDiskSplatData* Payload = ResolvedDiskPayload())
     {
         return &Payload->Splats;
@@ -169,10 +161,6 @@ const TArray<FGaussianSplatData>* UNiagaraGSDataInterface::GetSplatArray() const
 
 int32 UNiagaraGSDataInterface::GetResolvedSHDegree() const
 {
-    if (SplatAsset)
-    {
-        return SplatAsset->SHDegree;
-    }
     if (const FGSDiskSplatData* Payload = ResolvedDiskPayload())
     {
         return Payload->SHDegree;
@@ -188,7 +176,6 @@ bool UNiagaraGSDataInterface::CopyToInternal(UNiagaraDataInterface* Destination)
 {
     if (!Super::CopyToInternal(Destination)) return false;
     UNiagaraGSDataInterface* Dest = CastChecked<UNiagaraGSDataInterface>(Destination);
-    Dest->SplatAsset = SplatAsset;
     Dest->SourceFilePath = SourceFilePath;
     // Carry the auto-flush threshold onto the duplicate Niagara binds to the compute
     // script, so the proxy the GPU reads from sees the configured value.
@@ -203,8 +190,7 @@ bool UNiagaraGSDataInterface::Equals(const UNiagaraDataInterface* Other) const
 {
     if (!Super::Equals(Other)) return false;
     const UNiagaraGSDataInterface* OtherDI = CastChecked<const UNiagaraGSDataInterface>(Other);
-    return OtherDI->SplatAsset == SplatAsset
-        && OtherDI->SourceFilePath == SourceFilePath
+    return OtherDI->SourceFilePath == SourceFilePath
         && OtherDI->AutoFlushAfterRenders == AutoFlushAfterRenders;
 }
 
@@ -221,6 +207,19 @@ int32 UNiagaraGSDataInterface::GetSplatCount() const
 void UNiagaraGSDataInterface::RequestGlobalFlush()
 {
     const uint64 NewGen = GlobalFlushGeneration.IncrementExchange() + 1;
+
+    // Drop the "last resort" guess an unconfigured DI falls back to (see its
+    // declaration comment). A manual flush is an explicit "I'm done with this"
+    // signal from the user, so it's the one safe point to also forget which
+    // splat file was most recently loaded — otherwise a deleted/reconfigured
+    // source keeps ghosting into every unconfigured DI indefinitely. Does NOT
+    // touch DiskCache, so a still-active, correctly-configured DI does not pay
+    // a re-parse.
+    {
+        FScopeLock Lock(&DiskCacheCS);
+        GLastLoadedDiskData.Reset();
+    }
+
     UE_LOG(LogTemp, Log,
         TEXT("NiagaraGS: Flush requested (generation %llu) — proxies release on next render"),
         NewGen);
@@ -269,7 +268,7 @@ void UNiagaraGSDataInterface::PostLoad()
     Super::PostLoad();
 
     // Parse the disk file once on load (game thread) so the cache is populated
-    // before the render thread needs it. Asset-backed DIs already hold their data.
+    // before the render thread needs it.
     EnsureSplatDataLoaded();
 }
 
@@ -277,11 +276,10 @@ void UNiagaraGSDataInterface::PostLoad()
 void UNiagaraGSDataInterface::PostEditChangeProperty(
     FPropertyChangedEvent& PropertyChangedEvent)
 {
-    // When the source path or asset changes, drop the stale handle and re-resolve
+    // When the source path changes, drop the stale handle and re-resolve
     // immediately so the editor preview picks up the new data.
     const FName PropName = PropertyChangedEvent.GetPropertyName();
-    if (PropName == GET_MEMBER_NAME_CHECKED(UNiagaraGSDataInterface, SourceFilePath) ||
-        PropName == GET_MEMBER_NAME_CHECKED(UNiagaraGSDataInterface, SplatAsset))
+    if (PropName == GET_MEMBER_NAME_CHECKED(UNiagaraGSDataInterface, SourceFilePath))
     {
         ResolvedDiskData.Reset();
         EnsureSplatDataLoaded();
@@ -816,11 +814,11 @@ void UNiagaraGSDataInterface::SetShaderParameters(
     {
         SplatProxy.bDiagLogged = true;
         const TArray<FGaussianSplatData>* DiagSplats = GetSplatArray();
-        UE_LOG(LogTemp, Warning, TEXT("NiagaraGS: SetShaderParameters DIAG — bReady=%d bFlushed=%d gen=%llu/%llu SplatArray=%s count=%d SplatAsset=%s SourcePath='%s' DI=0x%p Proxy=0x%p"),
+        UE_LOG(LogTemp, Warning, TEXT("NiagaraGS: SetShaderParameters DIAG — bReady=%d bFlushed=%d gen=%llu/%llu SplatArray=%s count=%d SourcePath='%s' DI=0x%p Proxy=0x%p"),
             SplatProxy.bBuffersReady ? 1 : 0, SplatProxy.bManuallyFlushed ? 1 : 0,
             (uint64)GetFlushGeneration(), (uint64)SplatProxy.FlushedGeneration,
             DiagSplats ? TEXT("VALID") : TEXT("NULL"), DiagSplats ? DiagSplats->Num() : -1,
-            SplatAsset ? TEXT("set") : TEXT("null"), *SourceFilePath, this, &SplatProxy);
+            *SourceFilePath, this, &SplatProxy);
     }
 
     // 1) Global force-flush (BP node / scratchpad bool). A flush bumps a global
@@ -838,10 +836,11 @@ void UNiagaraGSDataInterface::SetShaderParameters(
         SplatProxy.bManuallyFlushed = true;
     }
 
-    // 2) Self-heal: upload the buffers once from the resolved CPU data (asset or
-    //    path-cached / last-loaded). This is what puts real data on the GPU, and it
-    //    runs BEFORE the spawn dispatch reads them. Skipped once intentionally
-    //    flushed so a flush is not undone on the very next bind.
+    // 2) Self-heal: upload the buffers once from the resolved CPU data (this DI's
+    //    handle, the process-wide path cache, or the last-loaded fallback). This
+    //    is what puts real data on the GPU, and it runs BEFORE
+    //    the spawn dispatch reads them. Skipped once intentionally flushed so a
+    //    flush is not undone on the very next bind.
     bool bUploadedThisCall = false;
     if (!SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed)
     {
