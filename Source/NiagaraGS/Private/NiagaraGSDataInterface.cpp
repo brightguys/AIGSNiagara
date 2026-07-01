@@ -990,10 +990,25 @@ void UNiagaraGSDataInterface::SetShaderParameters(
     // 1b) Hot-reload re-upload: a completed ReloadFromDisk() bumps a global data
     //    generation (see its declaration comment for why this is global rather
     //    than per-instance). If it has advanced past what THIS proxy last
-    //    uploaded, force a fresh upload even though buffers are already ready —
-    //    UploadData() releases the old buffers and creates new ones sized to the
-    //    new splat count. This is the one bounded render-thread cost of a swap;
-    //    the game thread never blocked on the fetch/parse that produced it.
+    //    uploaded, force a fresh upload — UploadData() releases the old buffers
+    //    (if any) and creates new ones sized to the new splat count. This is the
+    //    one bounded render-thread cost of a swap; the game thread never blocked
+    //    on the fetch/parse that produced it.
+    //
+    //    Deliberately NOT gated on bBuffersReady/bManuallyFlushed — a reload that
+    //    completed AFTER a flush must be able to override the flush latch, or a
+    //    flush-then-reload sequence deadlocks permanently: section 1 sets
+    //    bBuffersReady=false + bManuallyFlushed=true; section 2 (self-heal) then
+    //    requires bManuallyFlushed==false to run, but the ONLY thing that resets
+    //    bManuallyFlushed is a successful UploadData() call — which neither this
+    //    branch (gated on bBuffersReady==true) nor section 2 (gated on
+    //    bManuallyFlushed==false) could ever reach again. Confirmed by regression:
+    //    flush, then reload a new file → every particle collapses onto the
+    //    zeroed fallback buffer forever, surviving even a full component
+    //    reregister (that recreates the Niagara Component's scene render proxy,
+    //    not this DI's own FNDIGaussianSplatProxy — same stuck object either way).
+    //    A newer reload is a strictly more specific signal of intent ("show THIS
+    //    data now") than a preceding flush's "stay quiet", so it wins.
     //
     //    Deliberately reads GLastLoadedDiskData directly here, NOT GetSplatArray()
     //    on `this`. This DI object (the GPU-bound duplicate) can have a NON-empty
@@ -1007,7 +1022,7 @@ void UNiagaraGSDataInterface::SetShaderParameters(
     //    count, but the GPU buffer kept showing the old splats. GLastLoadedDiskData
     //    is reliably the freshest payload as of the most recent successful load.
     const uint64 DataGen = GetDataGeneration();
-    if (SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed && DataGen != SplatProxy.UploadedDataGeneration)
+    if (DataGen != SplatProxy.UploadedDataGeneration)
     {
         TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> FreshPayload;
         {
