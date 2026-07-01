@@ -23,6 +23,10 @@ struct FGSDiskSplatData
     FString SourcePath;   // absolute path this payload was parsed from (cache key)
 };
 
+// Broadcast on the game thread once a ReloadFromDisk() call completes or fails.
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
+    FOnGaussianSplatReloadComplete, bool, bSuccess, int32, NewSplatCount);
+
 /**
  * Custom Niagara Data Interface exposing Gaussian Splat data to GPU particles.
  *
@@ -51,7 +55,7 @@ struct FGSDiskSplatData
  *                      once and cached process-wide (keyed by absolute path).
  * ─────────────────────────────────────────────────────────────────────────────
  */
-UCLASS(EditInlineNew, Category = "Gaussian Splats",
+UCLASS(EditInlineNew, BlueprintType, Category = "Gaussian Splats",
     meta = (DisplayName = "Gaussian Splat Data Interface"))
     class NIAGARAGS_API UNiagaraGSDataInterface : public UNiagaraDataInterface
 {
@@ -75,6 +79,27 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splats|Memory",
         meta = (ClampMin = "0", DisplayName = "Auto-Flush After Renders"))
     int32 AutoFlushAfterRenders = 0;
+
+    // ── Hot reload (async, off the game thread) ───────────────────────────
+    // Re-fetches and re-parses SourceFilePath (or NewSourceFilePath if non-empty,
+    // which also becomes the new SourceFilePath) on a background thread pool, then
+    // atomically swaps the CPU splat data on the game thread and bumps a global
+    // generation counter that the GPU proxy checks in SetShaderParameters.
+    // Currently-rendered splats keep rendering unchanged until the swap — there is
+    // no "goes blank" gap. GPU buffers are recreated at the new splat count on the
+    // next render after the swap completes (one bounded render-thread cost, same
+    // as the very first upload); the game thread itself never blocks on the
+    // file read or parse.
+    // NOTE: this only swaps CPU/GPU splat data. Niagara's GPU spawn burst count is
+    // set once by the emitter, so respawning against the new count needs the
+    // owning component reset (e.g. call ResetSystem() from OnReloadComplete).
+    UFUNCTION(BlueprintCallable, Category = "Gaussian Splats",
+        meta = (DisplayName = "Reload Gaussian Splats From Disk"))
+    void ReloadFromDisk(const FString& NewSourceFilePath);
+
+    // Fired on the game thread once a ReloadFromDisk() call completes or fails.
+    UPROPERTY(BlueprintAssignable, Category = "Gaussian Splats")
+    FOnGaussianSplatReloadComplete OnReloadComplete;
 
     // ── UNiagaraDataInterface interface ───────────────────────────────────
 #if WITH_EDITORONLY_DATA
@@ -156,6 +181,9 @@ public:
     // Current global flush generation (read by proxies in SetShaderParameters).
     static uint64 GetFlushGeneration();
 
+    // Current global data generation (read by proxies in SetShaderParameters).
+    static uint64 GetDataGeneration();
+
 private:
     // ── Function name constants ───────────────────────────────────────────
     static const FName Name_GetSplatCount;
@@ -187,6 +215,28 @@ private:
     static FCriticalSection DiskCacheCS;
     static TMap<FString, TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe>> DiskCache;
 
+    // Resolves ResolvedPath via DiskCache, parsing (and caching) on a miss. Safe to
+    // call from any thread — DiskCache access is locked, and the parser is
+    // stateless — so both the synchronous initial load (EnsureSplatDataLoaded, game
+    // thread) and the background half of ReloadFromDisk (thread pool) share it.
+    // Updates GLastLoadedDiskData on every resolve, but deliberately does NOT bump
+    // GDataGeneration — that only happens for an explicit completed reload (see
+    // ApplyReloadResult), not routine/PostLoad resolution, otherwise every
+    // unrelated DI's PostLoad cache-hit would force every other proxy in the
+    // project to needlessly re-upload.
+    static TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> LoadOrParseDiskPayload(const FString& ResolvedPath);
+
+    // Background half of ReloadFromDisk(): applies a completed async reload on the
+    // game thread. Discards the result if a newer ReloadFromDisk() call has since
+    // superseded it (out-of-order async completion).
+    void ApplyReloadResult(uint64 RequestId, TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> NewPayload);
+
+    // Identifies the most recent ReloadFromDisk() call on THIS instance, so a
+    // stale completion can be discarded. Plain (not atomic) — only ever touched on
+    // the game thread (ReloadFromDisk and ApplyReloadResult both run there); the
+    // background task only carries the value captured at dispatch time.
+    uint64 ReloadRequestCounter = 0;
+
     // Last-resort fallback for a DI instance with an EMPTY SourceFilePath — this
     // happens because Niagara's GPU-compute-script binding for this DI can be a
     // duplicate captured at system-instance init time, before the user parameter
@@ -200,6 +250,17 @@ private:
     // Global flush generation. A manual flush increments it; a proxy compares it to
     // the generation it last serviced and releases once when it advances.
     static TAtomic<uint64> GlobalFlushGeneration;
+
+    // Global data generation. Bumped only by a completed ReloadFromDisk() (see
+    // ApplyReloadResult), never by routine resolution. Global — like
+    // GlobalFlushGeneration — for the same reason: the GPU-bound DI object in
+    // SetShaderParameters may not be the one ReloadFromDisk() was called on (see
+    // GLastLoadedDiskData above), so a per-instance counter would not be visible
+    // to the proxy that actually needs to re-upload. Trade-off: reloading ANY
+    // system also makes every OTHER unrelated system's proxy redundantly
+    // re-upload its own (unchanged) data once — acceptable given the plugin's
+    // existing "single active splat file assumed" coarseness elsewhere.
+    static TAtomic<uint64> GDataGeneration;
 
     // Rising-edge latch for the scratchpad/BP FlushGPUBuffers bool so holding it
     // high requests a single (global) flush, not one per frame. Transient, per-DI.

@@ -70,6 +70,11 @@ struct FNDIGaussianSplatProxy : public FNiagaraDataInterfaceProxy
     // a fresh proxy (level reload / recompile) re-uploads after this latches.
     bool   bManuallyFlushed = false;
     uint64 FlushedGeneration = 0;
+    // The global data generation (UNiagaraGSDataInterface::GDataGeneration) as of
+    // this proxy's last successful upload. SetShaderParameters re-uploads whenever
+    // this falls behind the current generation, even if bBuffersReady is already
+    // true — that is what makes ReloadFromDisk()'s swap show up on GPU.
+    uint64 UploadedDataGeneration = 0;
     bool   bDiagLogged       = false;   // one-shot diagnostic in SetShaderParameters
 
     // Auto-flush bookkeeping (render thread). RendersSinceReady counts SetShader
