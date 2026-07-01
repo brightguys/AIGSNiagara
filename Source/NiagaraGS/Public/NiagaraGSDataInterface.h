@@ -172,6 +172,13 @@ public:
     // Bumps the global flush generation; every live Gaussian Splat proxy releases
     // its VRAM the next time it renders. (Per-instance targeting was removed with
     // the per-instance lifecycle; use a separate DI/component per system to isolate.)
+    // Static + BlueprintCallable: Blueprint can call this directly with no target
+    // object needed (no Cast required), now that GetDataInterface(...) → Cast to
+    // this class works (see the BlueprintType note above). The pre-existing
+    // UNiagaraGSBlueprintLibrary::FlushGaussianSplatBuffers(Component) wrapper is
+    // unaffected and still works the same way.
+    UFUNCTION(BlueprintCallable, Category = "Gaussian Splats",
+        meta = (DisplayName = "Flush Gaussian Splat GPU Buffers"))
     static void RequestGlobalFlush();
 
     // Blueprint helper entry point (UNiagaraGSBlueprintLibrary). The component is

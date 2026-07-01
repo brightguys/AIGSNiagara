@@ -152,9 +152,31 @@ stalls and stale bytecode). Respect them.
   the fallback above. `ReloadRequestCounter`, by contrast, IS per-instance (plain
   `uint64`, game-thread-only) — it only discards a stale out-of-order completion
   on the same object, so it doesn't need to be global.
+  **On a generation-mismatch re-upload, read `GLastLoadedDiskData` directly —
+  never `GetSplatArray()`/`this`.** Confirmed by regression: after one successful
+  load, the GPU-bound duplicate already has a non-empty (but stale)
+  `SourceFilePath`/`ResolvedDiskData` from before the reload — Niagara never
+  refreshes a duplicate's properties once created, only `CopyToInternal`s them at
+  creation time. `GetSplatArray()` on that stale duplicate does NOT fail (which
+  would at least be visible); it "succeeds" by resolving the OLD file's still-live
+  `DiskCache` entry (never evicted, keyed by the duplicate's own stale path) and
+  silently re-uploads the same old data. Symptom looked like "reload does
+  nothing": `OnReloadComplete` fired with the correct new splat count
+  (CPU/VM functions always resolve against the live object, so that part is
+  correct), but the GPU buffer never changed. `GLastLoadedDiskData` is reliably
+  the freshest payload as of the most recent successful load, so bypass per-object
+  resolution entirely for this specific branch.
   `ReloadFromDisk` only swaps CPU/GPU data; it does not reset the Niagara system,
   so the GPU spawn burst count (set once by the emitter) won't itself change —
   react to `OnReloadComplete` and call `ResetSystem()` on the owning component.
+  Do NOT reach for `ReinitializeSystem()` here even though the engine's own
+  Details-panel "Reset" button effectively does that (`Activate(true)` +
+  `ReregisterComponent()`, confirmed in `NiagaraComponentDetails.cpp`) — that
+  fully destroys and recreates the system instance (a real hitch, defeating the
+  point of hot-swapping) and was only "necessary" before this fix because it
+  incidentally forced a fresh, non-stale GPU-bound duplicate. Plain `ResetSystem()`
+  is sufficient now that the generation-mismatch branch reads
+  `GLastLoadedDiskData` directly.
 - **The `UCLASS` needs `BlueprintType`, or none of this is reachable from
   Blueprint.** Blueprint's "Cast To" node requires the target class to declare
   `BlueprintType`; without it there is no way to cast a generic

@@ -936,13 +936,29 @@ void UNiagaraGSDataInterface::SetShaderParameters(
     //    UploadData() releases the old buffers and creates new ones sized to the
     //    new splat count. This is the one bounded render-thread cost of a swap;
     //    the game thread never blocked on the fetch/parse that produced it.
+    //
+    //    Deliberately reads GLastLoadedDiskData directly here, NOT GetSplatArray()
+    //    on `this`. This DI object (the GPU-bound duplicate) can have a NON-empty
+    //    but STALE SourceFilePath/ResolvedDiskData from BEFORE the reload — Niagara
+    //    never refreshes a duplicate's properties once created, so ReloadFromDisk()
+    //    updates the live/configured object only. GetSplatArray() on a stale
+    //    duplicate would "successfully" resolve the OLD file's still-cached
+    //    DiskCache entry (keyed by the duplicate's own stale path) and silently
+    //    re-upload the same old data — confirmed by regression: the generation
+    //    mismatch fired, GetSplatCount() (CPU/VM, always correct) showed the new
+    //    count, but the GPU buffer kept showing the old splats. GLastLoadedDiskData
+    //    is reliably the freshest payload as of the most recent successful load.
     const uint64 DataGen = GetDataGeneration();
     if (SplatProxy.bBuffersReady && !SplatProxy.bManuallyFlushed && DataGen != SplatProxy.UploadedDataGeneration)
     {
-        const TArray<FGaussianSplatData>* Splats = GetSplatArray();
-        if (Splats && Splats->Num() > 0)
+        TSharedPtr<const FGSDiskSplatData, ESPMode::ThreadSafe> FreshPayload;
         {
-            SplatProxy.UploadData(Splats->GetData(), Splats->Num(), GetResolvedSHDegree());
+            FScopeLock Lock(&DiskCacheCS);
+            FreshPayload = GLastLoadedDiskData;
+        }
+        if (FreshPayload.IsValid() && FreshPayload->Splats.Num() > 0)
+        {
+            SplatProxy.UploadData(FreshPayload->Splats.GetData(), FreshPayload->Splats.Num(), FreshPayload->SHDegree);
             SplatProxy.RendersSinceReady = 0;
             SplatProxy.UploadedDataGeneration = DataGen;
             bUploadedThisCall = true;
